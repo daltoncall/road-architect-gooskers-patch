@@ -1,0 +1,110 @@
+Road Architect: Goosker's Patch alpha 0.2.9
+Based on RoadArchitect 1.6.6 Fabric 1.20.1 (Apache-2.0).
+Upstream source: https://github.com/Shadscure/RoadArchitect
+
+Alpha 0.2.9 vegetation-drop cleanup
+------------------------------------
+- Keeps the existing amount of placed flowers, grass, petals, moss, and leaf
+  litter on finished trails.
+- Freshly constructed trail cells briefly suppress nearby loose plant/tree
+  item entities caused by delayed leaf decay or vegetation losing support.
+- Suppression is limited by position, item type, and time so unrelated drops
+  elsewhere in the chunk are left alone.
+
+Alpha 0.2.8 crash and canopy cleanup changes
+---------------------------------------------
+- Post-processing remains computationally asynchronous, but all PathStorage,
+  addon, build-queue, and loaded-chunk enqueue mutations are now committed on
+  the Minecraft server thread.
+- Only one post-processing job per dimension runs at a time, preventing two
+  trail jobs from racing over shared SavedData and chunk work.
+- Tree recognition now uses Minecraft's log/leaves tags and LeavesBlock in
+  addition to name fallbacks, including modded trees that previously escaped
+  cleanup.
+- Canopies crossing a trail now search farther for their trunk and remove the
+  whole intersecting tree. Truly orphaned leaf clusters over a trail are
+  removed without touching leaf litter or ordinary ground vegetation.
+
+Alpha 0.2.7 terrain and placement changes
+-----------------------------------------
+1. Roads cannot use generated structures as terrain.
+   - Natural-looking roof coverings no longer bypass structure protection.
+   - Building blocks below and around a proposed road cell veto placement.
+   - Road decorations use the same resolved, protected ground surface.
+
+2. Road placement is surface-conforming and support-aware.
+   - Every road-width cell resolves independently to nearby exposed natural terrain.
+   - A road cell requires solid support immediately below it.
+   - Ravine floors outside the local search range are skipped; no floating bridge of trail blocks is created.
+
+3. Preparation cannot damage ordinary terrain.
+   - PREPARE records state in memory and performs no terrain write.
+   - FINALIZE changes only cells that receive a road surface.
+   - Flowers, leaf litter, snow, grass, and other overlays generated between phases are never rolled back.
+
+4. Intersecting trees are removed completely.
+   - A trunk intersecting the road corridor triggers bounded removal of its trunk and canopy.
+   - Bamboo columns intersecting the corridor are removed vertically.
+   - Isolated leaves and ordinary ground vegetation are not cleanup triggers.
+
+5. Legacy Structure Void cleanup covers the former alpha 0.2.4/0.2.5 preparation radius.
+
+6. Parallel-road convergence is stronger.
+   - Nearby parallel runs merge through eased transitions.
+   - Crossing and perpendicular paths remain excluded by the tangent-angle test.
+
+Retained alpha 0.2.6 marker guarantees
+---------------------------------------
+1. Removed physical Structure Void staging.
+   - PREPARE now records original block and surface information in memory only.
+   - It never places Structure Void, Barrier, Bedrock, or another temporary block.
+   - Legacy Structure Void markers from alpha 0.2.4/0.2.5 are recognized and removed.
+
+2. Removed the marker requirement from FINALIZE.
+   - Final road placement no longer fails merely because no temporary marker exists.
+   - Generated-building, water, and ice protection remain in force.
+
+3. Added finalization-time vegetation cleanup.
+   - The bounded loaded-chunk-only tree/bamboo pass now runs again immediately before final road placement.
+   - This catches trees generated between PREPARE and FINALIZE and prevents floating trunks/canopies.
+
+Retained alpha 0.2.5 stability/elevation changes
+-----------------------------------------------
+1. Removed the alpha 0.2.4 backfill centerline re-snap.
+   - Backfill now keeps the already-postprocessed path coordinates/Y values.
+   - No extra +/-3 search of the live world is used to move the road up/down during physical placement.
+   - This avoids stacking a second terrain solver on top of Road Architect's original post-processing/profile logic.
+
+2. Removed the +2-block PREPARE/CLEARANCE ring outside the visible road.
+   - PREPARE is confined to the actual trail footprint.
+   - Backfill no longer stages/restores two extra blocks of ordinary terrain on both sides of the road.
+   - This directly targets the torn/jumbled terrain around elevation changes and also reduces placement work.
+
+3. Tree and bamboo corridor cleanup.
+   - Runs only on actual ROAD cells during PREPARE.
+   - A normal road cell performs at most two vegetation state checks.
+   - A trunk that physically intersects the road triggers bounded tree cleanup so upper logs are not left floating over the trail.
+   - Natural bamboo intersecting the road is removed vertically.
+   - A canopy-only intersection clears road headroom instead of felling an unrelated nearby tree.
+   - Cleanup is loaded-chunk-only and is skipped when generated-building protection says the road is next to a building.
+   - Snow, flowers, grass/litter and other preserved overlays are not part of vegetation cleanup.
+
+4. Bamboo is now treated like tree material by loaded-height correction.
+   - The road no longer mistakes the top of a bamboo stalk for the ground surface.
+
+Retained from earlier builds
+----------------------------
+- allowChunkLoads=false structure discovery / no forced scan chunk loads.
+- Async pathfinding and loaded-chunk backfill.
+- Generated-structure protection.
+- In-memory preparation and legacy Structure Void/Barrier cleanup.
+- Ordinary terrain/Terrain Slabs road priority.
+- Water and ice avoidance; no buoy roads.
+- Snow/flower/soft-overlay preservation and grass-block property preservation.
+- Natural meander, graph deduplication, and parallel-road coalescing.
+
+Crash note
+----------
+The ServerEntityManager ConcurrentModificationException in the Sep 13 test log has no RoadArchitect frame in its crash stack. The same class_5579 crash signature is present in much older Road Architect patch sessions, including alpha 0.0.9, so alpha 0.2.5 does not claim that unrelated/uncertain crash is fixed.
+
+Test new roads in untouched terrain before distribution.

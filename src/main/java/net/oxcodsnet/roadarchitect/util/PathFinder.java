@@ -1,0 +1,645 @@
+package net.oxcodsnet.roadarchitect.util;
+
+import it.unimi.dsi.fastutil.longs.Long2DoubleMap;
+import it.unimi.dsi.fastutil.longs.Long2DoubleOpenHashMap;
+import it.unimi.dsi.fastutil.longs.Long2LongMap;
+import it.unimi.dsi.fastutil.longs.Long2LongOpenHashMap;
+import net.minecraft.core.BlockPos;
+import net.minecraft.core.Holder;
+import net.minecraft.core.HolderSet;
+import net.minecraft.core.QuartPos;
+import net.minecraft.core.Registry;
+import net.minecraft.core.registries.Registries;
+import net.minecraft.server.level.ServerLevel;
+import net.minecraft.tags.BiomeTags;
+import net.minecraft.tags.TagKey;
+import net.minecraft.world.level.biome.Biome;
+import net.minecraft.world.level.biome.BiomeSource;
+import net.minecraft.world.level.biome.Climate;
+import net.minecraft.world.level.chunk.ChunkGenerator;
+import net.minecraft.world.level.levelgen.Heightmap;
+import net.minecraft.world.level.levelgen.RandomState;
+import net.oxcodsnet.roadarchitect.RoadArchitect;
+import net.oxcodsnet.roadarchitect.config.RAConfig;
+import net.oxcodsnet.roadarchitect.config.RAConfigHolder;
+import net.oxcodsnet.roadarchitect.storage.NodeStorage;
+import net.oxcodsnet.roadarchitect.storage.components.Node;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.util.*;
+
+import static net.oxcodsnet.roadarchitect.util.CacheManager.hash;
+import static net.oxcodsnet.roadarchitect.util.CacheManager.keyToPos;
+
+/**
+ * A* | ARA* поиск пути по настраиваемой X/Z-сети.
+ * <ul>
+ *   <li>Потокобезопасные кэши (FastUtil + централизованный CacheManager)</li>
+ *   <li>Поддержка позиционного поиска (между произвольными BlockPos)</li>
+ *   <li>Регулируемый вес эвристики (ε), чтобы переключаться между A* (ε=1) и Weighted A*</li>
+ * </ul>
+ */
+public class PathFinder {
+
+    /* ================ USER-TUNABLE PARAMS ================ */
+    public static final int GRID_STEP = 4;
+
+    /**
+     * Inflation factor ε для ARA* (Weighted A*)
+     */
+    public static final double HEURISTIC_WEIGHT = 1.5;
+
+    /**
+     * Базовый масштаб эвристики (адаптируется per-run через selectHeuristicScale)
+     */
+    public static final double HEURISTIC_SCALE = 95.0;
+
+    // Config is read via RAConfigHolder in runtime per-world
+
+    private static final Logger LOGGER = LoggerFactory.getLogger(RoadArchitect.MOD_ID + "/" + PathFinder.class.getSimpleName());
+    private static final int[][] OFFSETS = generateOffsets();
+
+    private static final Map<TagKey<Biome>, Double> BIOME_COSTS = Map.of(
+            BiomeTags.IS_RIVER, 240.0,
+            BiomeTags.IS_OCEAN, 280.0,
+            BiomeTags.IS_DEEP_OCEAN, 320.0,
+            BiomeTags.IS_MOUNTAIN, 160.0,
+            BiomeTags.IS_BEACH, 160.0
+    );
+
+    /* =================== ПРОФАЙЛЕР =================== */
+
+    /**
+     * Щёлкалка профилирования
+     */
+    private static final boolean PROFILING_ENABLED = true;
+    private final NodeStorage nodes;
+    private final ServerLevel world;
+    private final int maxSteps; // глобальный потолок (сохранён для обратной совместимости)
+    private final double heuristicWeight;
+
+    /* ===================================================== */
+    /* ── горячие ссылки на объекты генерации мира ── */
+    private final ChunkGenerator generator;
+    private final RandomState noiseConfig;
+    private final Climate.Sampler noiseSampler;
+    private final BiomeSource biomeSource;
+    /**
+     * Счётчики вызовов семплеров на один запуск поиска
+     */
+    private long profHeightCalls = 0L;
+    private long profBiomeCalls = 0L;
+    private long profStabCalls = 0L;
+    // Compiled forbidden biome selectors (per-registry)
+    private volatile List<HolderSet<Biome>> forbiddenBiomeLists;
+
+    public PathFinder(NodeStorage nodes, ServerLevel world, int maxSteps) {
+        this(nodes, world, maxSteps, HEURISTIC_WEIGHT);
+    }
+
+    public PathFinder(NodeStorage nodes, ServerLevel world, int maxSteps, double heuristicWeight) {
+        this.nodes = nodes;
+        this.world = world;
+        this.maxSteps = maxSteps;
+        this.heuristicWeight = heuristicWeight;
+
+        this.generator = world.getChunkSource().getGenerator();
+        this.noiseConfig = world.getChunkSource().randomState();
+        this.noiseSampler = noiseConfig.sampler();
+        this.biomeSource = generator.getBiomeSource();
+    }
+
+    private static double stepCost(int[] off) {
+        return (Math.abs(off[0]) == GRID_STEP && Math.abs(off[1]) == GRID_STEP) ? 1.5 : 1.0;
+    }
+
+    /* ───────────────────────── Стоимости ───────────────────────── */
+
+    private static double elevationCost(int y1, int y2) {
+        return Math.abs(y1 - y2) * 40.0;
+    }
+
+    private static double biomeCost(Holder<Biome> biome) {
+        for (Map.Entry<TagKey<Biome>, Double> entry : BIOME_COSTS.entrySet()) {
+            if (biome.is(entry.getKey())) {
+                return entry.getValue();
+            }
+        }
+        return 0.0;
+    }
+
+    /**
+     * Штраф за нахождение рядом с запрещённым биомом (из конфига).
+     * Проверяет биомы в квадрате вокруг точки и возвращает штраф, если найден запрещённый.
+     */
+    private double forbiddenProximityPenalty(int x, int z, int y) {
+        RAConfig cfg = RAConfigHolder.get();
+        int buf = cfg.forbiddenBiomeBufferBlocks();
+        if (buf <= 0) return 0.0;
+        int radiusSteps = buf / GRID_STEP;
+        if (radiusSteps <= 0) return 0.0;
+
+        for (int i = -radiusSteps; i <= radiusSteps; i++) {
+            for (int j = -radiusSteps; j <= radiusSteps; j++) {
+                if (i == 0 && j == 0) continue;
+
+                int checkX = x + i * GRID_STEP;
+                int checkZ = z + j * GRID_STEP;
+                if (isForbiddenBiome(sampleBiome(checkX, checkZ, y))) {
+                    return cfg.forbiddenBiomeProximityPenalty();
+                }
+            }
+        }
+        return 0.0;
+    }
+
+    /**
+     * Штраф за близость к воде (океан/река), чтобы не прижиматься к побережью.
+     */
+    private double coastProximityPenalty(int x, int z, int y) {
+        RAConfig cfg = RAConfigHolder.get();
+        if (!cfg.preferLandOverWater()) return 0.0;
+        int buf = cfg.coastAvoidBufferBlocks();
+        if (buf <= 0) return 0.0;
+        int radiusSteps = buf / GRID_STEP;
+        if (radiusSteps <= 0) return 0.0;
+
+        for (int i = -radiusSteps; i <= radiusSteps; i++) {
+            for (int j = -radiusSteps; j <= radiusSteps; j++) {
+                if (i == 0 && j == 0) continue;
+                int checkX = x + i * GRID_STEP;
+                int checkZ = z + j * GRID_STEP;
+                Holder<Biome> b = sampleBiome(checkX, checkZ, y);
+                if (isWater(b)) {
+                    return cfg.coastProximityPenalty();
+                }
+            }
+        }
+        return 0.0;
+    }
+
+    private static double yLevelCost(int y) {
+        return y <= 63 ? 240.0 : 0.0;
+    }
+
+    private static boolean isSteep(int y1, int y2) {
+        return Math.abs(y1 - y2) > 3;
+    }
+
+    /**
+     * Октильная эвристика с явным scale.
+     */
+    private static double heuristic(int x, int z, BlockPos goal, double scale) {
+        int dx = Math.abs(x - goal.getX());
+        int dz = Math.abs(z - goal.getZ());
+        double a = dx + dz - 0.5 * Math.min(dx, dz);
+        return a * scale;
+    }
+
+    /* ───────────────────────── Эвристика ───────────────────────── */
+
+    private static double heuristic(BlockPos a, BlockPos b, double scale) {
+        return heuristic(a.getX(), a.getZ(), b, scale);
+    }
+
+    /**
+     * Перегрузки по-старому (по умолчанию берём базовый HEURISTIC_SCALE).
+     */
+    private static double heuristic(int x, int z, BlockPos goal) {
+        return heuristic(x, z, goal, HEURISTIC_SCALE);
+    }
+
+    private static double heuristic(BlockPos a, BlockPos b) {
+        return heuristic(a, b, HEURISTIC_SCALE);
+    }
+
+    /**
+     * Непрерывная подстройка масштаба эвристики по L1‑длине запроса.
+     * Плавно интерполируем [L0..L1] → [80..120] через smoothstep.
+     */
+    private static double selectHeuristicScale(BlockPos start, BlockPos goal) {
+        int l1 = Math.abs(start.getX() - goal.getX()) + Math.abs(start.getZ() - goal.getZ());
+        final double L0 = 200.0;   // «короткий» запрос
+        final double L1 = 1200.0;  // «дальний» запрос
+        double t = (l1 - L0) / (L1 - L0);
+        if (t < 0.0) t = 0.0;
+        else if (t > 1.0) t = 1.0;
+        double s = t * t * (3.0 - 2.0 * t); // smoothstep
+        double scale = 80.0 + s * (120.0 - 80.0);
+        return Math.max(80.0, Math.min(120.0, scale));
+    }
+
+    /**
+     * Выбор локального лимита шагов на запуск исходя из L1‑дистанции.
+     * Нормализует усилие под длину, чтобы дальние маршруты не «капались» преждевременно.
+     */
+    private static int selectMaxSteps(BlockPos start, BlockPos goal) {
+        int l1 = Math.abs(start.getX() - goal.getX()) + Math.abs(start.getZ() - goal.getZ());
+        double k = 16.0;      // коэффициент усилия на один блок L1
+        int min = 512;        // защитный минимум (убирает кейсы iterations=1–4)
+        int max = 200_000;    // жёсткий максимум на запуск (страховка)
+        long est = Math.round((k * l1) / GRID_STEP);
+        if (est < min) return min;
+        if (est > max) return max;
+        return (int) est;
+    }
+
+    /* ───────────────────────── Динамический лимит шагов ───────────────────────── */
+
+    private static BlockPos snap(BlockPos p) {
+        int x = Math.floorDiv(p.getX(), GRID_STEP) * GRID_STEP;
+        int z = Math.floorDiv(p.getZ(), GRID_STEP) * GRID_STEP;
+        return new BlockPos(x, p.getY(), z);
+    }
+
+    /* ───────────────────────── Вспомогательное ───────────────────────── */
+
+    private static int[][] generateOffsets() {
+        int d = GRID_STEP;
+        return new int[][]{{d, 0}, {-d, 0}, {0, d}, {0, -d}, {d, d}, {d, -d}, {-d, d}, {-d, -d}};
+    }
+
+    /**
+     * Поиск по идентификаторам узлов (как и раньше).
+     */
+    public List<BlockPos> findPath(String fromId, String toId) {
+        Node startNode = nodes.all().get(fromId);
+        Node endNode = nodes.all().get(toId);
+        if (startNode == null || endNode == null) {
+            DebugLog.info(LOGGER, "Missing node(s) {} or {}", fromId, toId);
+            return List.of();
+        }
+        return aStarPositions(snap(startNode.pos()), snap(endNode.pos()));
+    }
+
+    /* ───────────────────────── Публичный API ───────────────────────── */
+
+    /**
+     * Поиск между произвольными позициями (для локального реплана).
+     */
+    public List<BlockPos> findPath(BlockPos from, BlockPos to) {
+        return aStarPositions(snap(from), snap(to));
+    }
+
+    private List<BlockPos> aStarPositions(BlockPos startPos, BlockPos endPos) {
+        ProfileSession ps = PROFILING_ENABLED ? new ProfileSession(startPos, endPos) : null;
+        try {
+            return aStarPositions(startPos, endPos, ps);
+        } finally {
+            if (PROFILING_ENABLED) {
+                logProfile(ps);
+                profHeightCalls = profBiomeCalls = profStabCalls = 0L;
+            }
+        }
+    }
+
+    /* ───────────────────────── Реализация A* ───────────────────────── */
+
+    private List<BlockPos> aStarPositions(BlockPos startPos, BlockPos endPos, ProfileSession ps) {
+        record Rec(long key, double g, double f) {
+        }
+
+        long startKey = hash(startPos.getX(), startPos.getZ());
+        long endKey = hash(endPos.getX(), endPos.getZ());
+
+        // ── адаптивный масштаб эвристики и локальный лимит шагов ──
+        final double localScale = selectHeuristicScale(startPos, endPos);
+        final int localStepCap = Math.min(selectMaxSteps(startPos, endPos), this.maxSteps);
+        if (ps != null) {
+            ps.localScale = localScale;
+            ps.stepCap = localStepCap;
+        }
+
+        // ── метрики прогресса для частичного принятия ──
+        final int initialL1 = Math.abs(startPos.getX() - endPos.getX()) + Math.abs(startPos.getZ() - endPos.getZ());
+        int bestMd = Integer.MAX_VALUE;
+        long bestKey = startKey;
+
+        PriorityQueue<Rec> open = new PriorityQueue<>(Comparator.comparingDouble(r -> r.f));
+        Long2DoubleMap gScore = new Long2DoubleOpenHashMap();
+        gScore.defaultReturnValue(Double.MAX_VALUE);
+        Long2LongMap parent = new Long2LongOpenHashMap();
+
+        gScore.put(startKey, 0.0);
+        open.add(new Rec(startKey, 0.0, heuristic(startPos, endPos, localScale) * heuristicWeight));
+
+        int iterations = 0;
+        while (!open.isEmpty() && iterations++ < localStepCap) {
+            if (ps != null) {
+                ps.iterations++;
+            }
+
+            Rec current = open.poll();
+            if (current.g() > gScore.get(current.key())) {
+                continue; // фильтр "протухших" записей
+            }
+
+            int curX = (int) (current.key >> 32);
+            int curZ = (int) current.key;
+            int curY = sampleHeight(curX, curZ);
+
+            // ── метрики сходимости ──
+            int md = Math.abs(curX - endPos.getX()) + Math.abs(curZ - endPos.getZ());
+            if (ps != null) {
+                ps.lastL1 = md;
+                if (current.f() < ps.bestF) ps.bestF = current.f();
+                if (md < ps.bestL1) {
+                    ps.bestL1 = md;
+                    ps.stallIters = 0;
+                } else {
+                    ps.stallIters++;
+                }
+            }
+            if (md < bestMd) {
+                bestMd = md;
+                bestKey = current.key;
+            }
+
+            if (current.key == endKey) {
+                List<BlockPos> path = reconstructVertices(current.key, startKey, parent);
+                if (ps != null) {
+                    ps.avgStepOnPath = computeAvgCostOfPathVertices(path);
+                    ps.pathFound = true;
+                    ps.bestL1 = Math.min(ps.bestL1, md);
+                }
+                return path;
+            }
+
+            for (int[] off : OFFSETS) {
+                int nx = curX + off[0];
+                int nz = curZ + off[1];
+                long neighKey = hash(nx, nz);
+                if (ps != null) {
+                    ps.neighborsChecked++;
+                }
+
+                int ny = sampleHeight(nx, nz);
+                if (isSteep(curY, ny)) {
+                    continue;
+                }
+
+                double stab = sampleStability(nx, nz, ny);
+                if (stab == Double.MAX_VALUE) {
+                    continue;
+                }
+
+                Holder<Biome> bEntry = sampleBiome(nx, nz, ny);
+                if (isForbiddenBiome(bEntry)) {
+                    continue;
+                }
+                double bCost = biomeCost(bEntry);
+
+                // Штрафы по настройкам
+                RAConfig cfg = RAConfigHolder.get();
+                double preferWaterPenalty = (cfg.preferLandOverWater() && isWater(bEntry)) ? cfg.waterStepPenalty() : 0.0;
+                double proxPenalty = forbiddenProximityPenalty(nx, nz, ny);
+                double coastPenalty = coastProximityPenalty(nx, nz, ny);
+
+                double inc = stepCost(off)
+                        + elevationCost(curY, ny)
+                        + bCost
+                        + yLevelCost(ny)
+                        + stab
+                        + preferWaterPenalty
+                        + proxPenalty
+                        + coastPenalty;
+
+                double tentativeG = gScore.get(current.key) + inc;
+
+                if (tentativeG < gScore.get(neighKey)) {
+                    parent.put(neighKey, current.key);
+                    gScore.put(neighKey, tentativeG);
+                    if (ps != null) {
+                        ps.relaxationsAccepted++;
+                        ps.sumStepCosts += inc;
+                    }
+                    double f = tentativeG + heuristic(nx, nz, endPos, localScale) * heuristicWeight;
+                    open.add(new Rec(neighKey, tentativeG, f));
+                }
+            }
+        }
+
+        if (ps != null) {
+            ps.hitCap = !open.isEmpty();
+        }
+
+        // ── Fallback: частичное принятие при высоком прогрессе ──
+        boolean canAcceptPartial = initialL1 > 0 && bestMd != Integer.MAX_VALUE && RAConfigHolder.get().acceptPartialPaths();
+        double progress = canAcceptPartial ? (double) (initialL1 - bestMd) / (double) initialL1 : 0.0;
+        if (canAcceptPartial && progress >= RAConfigHolder.get().partialProgressThreshold()) {
+            List<BlockPos> partial = reconstructVertices(bestKey, startKey, parent);
+            if (!partial.isEmpty()) {
+                if (ps != null) {
+                    ps.avgStepOnPath = computeAvgCostOfPathVertices(partial);
+                    ps.pathFound = true; // считаем частичный как полезный путь для подсказок
+                    ps.bestL1 = Math.min(ps.bestL1, bestMd);
+                }
+                if (DebugLog.isEnabled()) {
+                    DebugLog.info(LOGGER, "Accept partial path (progress={}%, len={}, threshold={}%) {} -> {}",
+                            String.format(Locale.ROOT, "%.1f", progress * 100.0),
+                            partial.size(),
+                            String.format(Locale.ROOT, "%.1f", RAConfigHolder.get().partialProgressThreshold() * 100.0),
+                            startPos.toShortString(), endPos.toShortString());
+                }
+                return partial;
+            }
+        }
+
+        DebugLog.info(LOGGER, "Path not found between {} and {} after {} iterations (cap={})",
+                startPos, endPos, Math.min(iterations, localStepCap), localStepCap);
+        return List.of();
+    }
+
+    private int sampleHeight(int x, int z) {
+        profHeightCalls++;
+        long key = hash(x, z);
+        return CacheManager.getHeight(world, key, () ->
+                generator.getBaseHeight(x, z, Heightmap.Types.WORLD_SURFACE_WG, world, noiseConfig)
+        );
+    }
+
+    /* ───────────────────────── Быстрые семплеры ───────────────────────── */
+
+    private double sampleStability(int x, int z, int y) {
+        profStabCalls++;
+        long key = hash(x, z);
+        return CacheManager.getStability(world, key, () -> TerrainAnalyzer.stabilityCost(world, x, z, y));
+    }
+
+    private Holder<Biome> sampleBiome(int x, int z, int y) {
+        profBiomeCalls++;
+        long key = hash(x, z);
+        return CacheManager.getBiome(world, key, () ->
+                biomeSource.getNoiseBiome(
+                        QuartPos.fromBlock(x),
+                        316,
+                        QuartPos.fromBlock(z),
+                        noiseSampler
+                )
+        );
+    }
+
+    private boolean isForbiddenBiome(Holder<Biome> biome) {
+        if (forbiddenBiomeLists == null) {
+            Registry<Biome> reg = world.registryAccess().registryOrThrow(Registries.BIOME);
+            forbiddenBiomeLists = BiomeSelectorUtil.compile(reg, RAConfigHolder.get().forbiddenBiomeSelectors());
+        }
+        return BiomeSelectorUtil.matches(biome, forbiddenBiomeLists);
+    }
+
+    private static boolean isWater(Holder<Biome> biome) {
+        return biome.is(BiomeTags.IS_OCEAN) || biome.is(BiomeTags.IS_DEEP_OCEAN) || biome.is(BiomeTags.IS_RIVER);
+    }
+
+    // Stability computation is provided by TerrainAnalyzer and cached via CacheManager.
+
+    /* ───────────────────────── Утилиты ───────────────────────── */
+
+    private List<BlockPos> reconstructVertices(long goal, long start, Long2LongMap parent) {
+        List<BlockPos> vertices = new ArrayList<>();
+        for (long k = goal; ; k = parent.get(k)) {
+            BlockPos p = keyToPos(k);
+            int y = sampleHeight(p.getX(), p.getZ());
+            vertices.add(new BlockPos(p.getX(), y, p.getZ()));
+            if (k == start) {
+                break;
+            }
+        }
+        Collections.reverse(vertices);
+        return vertices;
+    }
+
+    /**
+     * Средняя «цена шага» по уже восстановленному списку вершин пути.
+     */
+    private double computeAvgCostOfPathVertices(List<BlockPos> path) {
+        if (path.size() < 2) {
+            return 0.0;
+        }
+        double sum = 0.0;
+        int cnt = 0;
+        for (int i = 1; i < path.size(); i++) {
+            BlockPos a = path.get(i - 1);
+            BlockPos b = path.get(i);
+            int dx = b.getX() - a.getX();
+            int dz = b.getZ() - a.getZ();
+            int ay = a.getY();
+            int by = b.getY();
+
+            int[] off = new int[]{dx, dz};
+
+            double inc = stepCost(off)
+                    + elevationCost(ay, by)
+                    + biomeCost(sampleBiome(b.getX(), b.getZ(), by))
+                    + yLevelCost(by)
+                    + sampleStability(b.getX(), b.getZ(), by);
+
+            if (inc == Double.MAX_VALUE) {
+                continue;
+            }
+            sum += inc;
+            cnt++;
+        }
+        return cnt > 0 ? (sum / (double) cnt) : 0.0;
+    }
+
+    private void logProfile(ProfileSession ps) {
+        if (ps == null) {
+            return;
+        }
+
+        double avgStepAll = ps.relaxationsAccepted > 0
+                ? ps.sumStepCosts / (double) ps.relaxationsAccepted
+                : 0.0;
+
+        // совет даём ТОЛЬКО если путь найден
+        double suggested = 0.0;
+        boolean suggestable = ps.pathFound && ps.avgStepOnPath > 0.0;
+        if (suggestable) {
+            double base = ps.avgStepOnPath;
+            suggested = Math.max(80.0, Math.min(120.0, base));
+        }
+
+        // метрики сходимости
+        double progress = ps.initialL1 > 0
+                ? (double) (ps.initialL1 - Math.min(ps.bestL1, ps.initialL1)) / (double) ps.initialL1
+                : 0.0;
+
+        if (!DebugLog.isEnabled()) {
+            return;
+        }
+        DebugLog.info(
+                LOGGER,
+                """
+                        [A* profiler] {} -> {}
+                          iterations={}  neighbors={}  relaxations={}
+                          calls: height={}  biome={}  stability={}
+                          avg-step: path={}  all-relaxations={}
+                          localScale={}
+                          convergence: L1_start={}  L1_best={}  progress={}%  stallIters={}  bestF={}  stepCap={}  hitCap={}
+                          {}
+                        """,
+                ps.start.toShortString(), ps.goal.toShortString(),
+                ps.iterations, ps.neighborsChecked, ps.relaxationsAccepted,
+                profHeightCalls, profBiomeCalls, profStabCalls,
+                String.format(Locale.ROOT, "%.2f", ps.avgStepOnPath),
+                String.format(Locale.ROOT, "%.2f", avgStepAll),
+                String.format(Locale.ROOT, "%.1f", ps.localScale),
+                ps.initialL1, (ps.bestL1 == Integer.MAX_VALUE ? -1 : ps.bestL1),
+                String.format(Locale.ROOT, "%.1f", progress * 100.0),
+                ps.stallIters,
+                String.format(Locale.ROOT, "%.1f", ps.bestF),
+                ps.stepCap, ps.hitCap,
+                suggestable
+                        ? ("suggest HEURISTIC_SCALE ≈ " + String.format(Locale.ROOT, "%.1f", suggested))
+                        : "no suggestion (path not found)"
+        );
+    }
+
+    /* ───────────────────────── Лог профайлера ───────────────────────── */
+
+    private static final class ProfileSession {
+        final BlockPos start;
+        final BlockPos goal;
+
+        // основная статистика
+        int iterations = 0;
+        long neighborsChecked = 0L;
+        long relaxationsAccepted = 0L;
+
+        /**
+         * Сумма инкрементальных стоимостей по ВСЕМ принятым релаксациям
+         */
+        double sumStepCosts = 0.0;
+
+        /**
+         * Средняя цена шага по фактическому пути (если найден)
+         */
+        double avgStepOnPath = 0.0;
+        boolean pathFound = false;
+
+        /**
+         * Фактически использованный масштаб эвристики в этом запуске
+         */
+        double localScale = HEURISTIC_SCALE;
+
+        // ── метрики сходимости ──
+        int initialL1 = 0;
+        int bestL1 = Integer.MAX_VALUE;
+        int lastL1 = 0;
+        int stallIters = 0;          // итераций без улучшения bestL1
+        double bestF = Double.POSITIVE_INFINITY;
+
+        // ── динамический лимит шагов ──
+        int stepCap = 0;
+        boolean hitCap = false;
+
+        ProfileSession(BlockPos start, BlockPos goal) {
+            this.start = start;
+            this.goal = goal;
+            this.initialL1 = Math.abs(start.getX() - goal.getX()) + Math.abs(start.getZ() - goal.getZ());
+            this.lastL1 = this.initialL1;
+        }
+    }
+}

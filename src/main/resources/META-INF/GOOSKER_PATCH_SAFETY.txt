@@ -1,0 +1,19 @@
+Road Architect: Goosker's Patch alpha 0.2.9 safety invariants
+
+1. Road preparation is in-memory only. No Structure Void, Barrier, Bedrock, or other physical staging block may be placed.
+2. Legacy Structure Void and Barrier markers remain eligible for cleanup; new construction must never create them.
+3. No generated net/minecraft stub classes may be packaged in the release JAR.
+4. Structure discovery and backfill must remain loaded-chunk-only and must not force-load chunks.
+5. Water and vanilla ice remain road vetoes. Generated-building protection remains above road priority.
+6. Ordinary terrain, natural vegetation, and Terrain Slabs remain road-replaceable.
+7. Snow, flowers, and preserved soft overlays must not be destroyed merely because a road passes underneath them.
+8. PREPARE/CLEARANCE is confined to the actual physical trail footprint; no extra excavation/restoration ring is permitted.
+9. Backfill must use the already post-processed path profile and must not add a second live-world Y snap.
+10. Tree and bamboo cleanup must be bounded, loaded-chunk-only, road-intersection-triggered, and skipped near detected generated buildings.
+11. Vegetation cleanup must run during FINALIZE so vegetation generated after PREPARE cannot leave floating trunks or canopies.
+12. Parallel-road coalescing remains fail-open and must not merge crossing or perpendicular roads.
+13. Display name, internal version, and filename must remain synchronized.
+14. Release audit must prove there is no call that places a physical preparation marker.
+15. A non-road cell must never be removed or restored by the preparation pipeline.
+16. A road cell must resolve to exposed, immediately supported natural terrain and must not be supported by building blocks.
+17. Isolated leaves, leaf litter, flowers, snow, and ordinary ground vegetation are preserved.
