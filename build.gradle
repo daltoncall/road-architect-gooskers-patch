@@ -73,3 +73,43 @@ jar {
 remapJar {
     archiveFileName = "Road-Architect-Gooskers-Patch-${project.version}.jar"
 }
+
+// No additional test dependencies: run the checks against the actual mod utility.
+tasks.register('postLoadRegressionChecks', JavaExec) {
+    dependsOn testClasses
+    classpath = sourceSets.test.runtimeClasspath
+    mainClass = 'net.oxcodsnet.roadarchitect.util.PostLoadRegressionChecks'
+}
+check.dependsOn postLoadRegressionChecks
+
+// These are executable checks, rather than a JUnit suite.
+test {
+    dependsOn postLoadRegressionChecks
+    failOnNoDiscoveredTests = false
+}
+
+tasks.register('performanceRegressionChecks', JavaExec) {
+    dependsOn testClasses
+    classpath = sourceSets.test.runtimeClasspath
+    mainClass = 'net.oxcodsnet.roadarchitect.util.PerformanceRegressionChecks'
+}
+check.dependsOn performanceRegressionChecks
+test.dependsOn performanceRegressionChecks
+
+loom { mixin { useLegacyMixinAp = true; defaultRefmapName = "roadarchitect.tree-protection.refmap.json" } }
+
+tasks.register('treeRegressionChecks', JavaExec) {
+    dependsOn testClasses
+    classpath = sourceSets.test.runtimeClasspath
+    mainClass = 'net.oxcodsnet.roadarchitect.util.TreeRegressionChecks'
+}
+check.dependsOn treeRegressionChecks
+test.dependsOn treeRegressionChecks
+
+tasks.register('chunkUpdateRegressionChecks', JavaExec) {
+    dependsOn testClasses
+    classpath = sourceSets.test.runtimeClasspath
+    mainClass = 'net.oxcodsnet.roadarchitect.util.ChunkUpdateRegressionChecks'
+}
+check.dependsOn chunkUpdateRegressionChecks
+test.dependsOn chunkUpdateRegressionChecks

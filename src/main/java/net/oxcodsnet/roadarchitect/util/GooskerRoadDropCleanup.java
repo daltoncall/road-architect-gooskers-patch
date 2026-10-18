@@ -35,63 +35,17 @@ public final class GooskerRoadDropCleanup {
     private GooskerRoadDropCleanup() {
     }
 
+    /**
+     * 0.3.13: delayed item-entity cleanup is disabled. Road/tree removal uses
+     * no-drop block removal already; maintaining 45-second per-road-cell windows
+     * and scanning item entities every five ticks was not worth the tick cost.
+     */
     public static void mark(WorldGenLevel world, BlockPos roadPos) {
-        if (world == null || roadPos == null) {
-            return;
-        }
-        ServerLevel level;
-        try {
-            level = world.getLevel();
-        } catch (Throwable ignored) {
-            return;
-        }
-        if (level == null) {
-            return;
-        }
-        long chunkKey = ChunkPos.asLong(roadPos.getX() >> 4, roadPos.getZ() >> 4);
-        ChunkWindow window = ACTIVE.computeIfAbsent(level, key -> new ConcurrentHashMap<>())
-                .computeIfAbsent(chunkKey, key -> new ChunkWindow());
-        window.positions.put(roadPos.asLong(), System.nanoTime() + WINDOW_NANOS);
+        // no-op by design
     }
 
     public static void onServerTick(MinecraftServer server) {
-        if (server == null || server.getTickCount() % 5 != 0) {
-            return;
-        }
-        long now = System.nanoTime();
-        for (Map.Entry<ServerLevel, ConcurrentMap<Long, ChunkWindow>> worldEntry : ACTIVE.entrySet()) {
-            ServerLevel level = worldEntry.getKey();
-            ConcurrentMap<Long, ChunkWindow> chunks = worldEntry.getValue();
-            for (Map.Entry<Long, ChunkWindow> chunkEntry : chunks.entrySet()) {
-                long chunkKey = chunkEntry.getKey();
-                ChunkWindow window = chunkEntry.getValue();
-                window.positions.entrySet().removeIf(entry -> entry.getValue() < now);
-                if (window.positions.isEmpty()) {
-                    chunks.remove(chunkKey, window);
-                    continue;
-                }
-                int chunkX = ChunkPos.getX(chunkKey);
-                int chunkZ = ChunkPos.getZ(chunkKey);
-                if (!level.hasChunk(chunkX, chunkZ)) {
-                    continue;
-                }
-                AABB bounds = new AABB(
-                        (chunkX << 4) - HORIZONTAL_RADIUS,
-                        level.getMinBuildHeight(),
-                        (chunkZ << 4) - HORIZONTAL_RADIUS,
-                        (chunkX << 4) + 16 + HORIZONTAL_RADIUS,
-                        level.getMaxBuildHeight(),
-                        (chunkZ << 4) + 16 + HORIZONTAL_RADIUS);
-                for (ItemEntity entity : level.getEntitiesOfClass(ItemEntity.class, bounds)) {
-                    if (isVegetationDrop(entity.getItem()) && nearMarkedRoad(entity, window, now)) {
-                        entity.discard();
-                    }
-                }
-            }
-            if (chunks.isEmpty()) {
-                ACTIVE.remove(level, chunks);
-            }
-        }
+        // no-op by design
     }
 
     public static void clear() {

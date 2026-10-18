@@ -137,21 +137,9 @@ public final class RoadPostProcessor {
             return cached;
         }
         OptionalInt prepared = RoadFeature.lookupPreparedSurface(x, z);
-        int resolved = prepared.isPresent() ? prepared.getAsInt() : CacheManager.getHeight(world, x, z);
-        // Prefer the generator's natural surface. Live heightmaps can include a
-        // tree canopy or generated building roof and must not become a road Y.
-        if (generator != null && noiseConfig != null) {
-            try {
-                int generated = generator.getBaseHeight(
-                        x, z, Heightmap.Types.WORLD_SURFACE_WG, world, noiseConfig);
-                if (generated > world.getMinBuildHeight()) {
-                    resolved = generated;
-                }
-            } catch (Throwable ignored) {
-                // Keep the cached terrain height when a modded generator cannot
-                // answer this query safely.
-            }
-        }
+        // Reuse natural-height snapshots/cache instead of a general/live height
+        // lookup followed by a second generator noise calculation per column.
+        int resolved = prepared.isPresent() ? prepared.getAsInt() : CacheManager.getNaturalHeight(world, x, z);
         if (resolved < (bottomGuard = world.getMinBuildHeight() + 1)) {
             resolved = bottomGuard;
         }
@@ -241,15 +229,14 @@ public final class RoadPostProcessor {
         }
         PathStorage storage = PathStorage.get(world);
         PipelineProfiler.increment("postprocess.invocations");
-        int examined = 0;
-        for (Map.Entry<String, PathStorage.Status> e : storage.allStatuses().entrySet()) {
-            ++examined;
-            if (e.getValue() != PathStorage.Status.PENDING) continue;
-            RoadPostProcessor.schedule(world, storage, e.getKey());
+        String pending = storage.firstPendingKey();
+        if (pending != null) {
+            RoadPostProcessor.schedule(world, storage, pending);
             PipelineProfiler.increment("postprocess.entries_scheduled");
-            break;
+            PipelineProfiler.recordValue("postprocess.entries_examined", 1);
+        } else {
+            PipelineProfiler.recordValue("postprocess.entries_examined", 0);
         }
-        PipelineProfiler.recordValue("postprocess.entries_examined", examined);
     }
 
     private static void processChunk(ServerLevel world, ChunkPos chunk) {

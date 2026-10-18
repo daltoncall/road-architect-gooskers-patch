@@ -5,6 +5,8 @@ import net.minecraft.server.level.ServerLevel;
 import net.minecraft.world.level.ChunkPos;
 import net.oxcodsnet.roadarchitect.RoadArchitect;
 import net.oxcodsnet.roadarchitect.storage.RoadBuilderStorage;
+import net.oxcodsnet.roadarchitect.storage.PathDecorStorage;
+import net.oxcodsnet.roadarchitect.util.PathDecorUtil;
 import net.oxcodsnet.roadarchitect.util.DebugLog;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -34,6 +36,8 @@ public class RoadBuilderManager {
                 DebugLog.info(LOGGER, "Skipped road construction {} ({} steps) because path too short", key, path == null ? 0 : path.size());
                 continue;
             }
+            // Check/invalidate decoration metrics once when a path changes, not each tick.
+            PathDecorUtil.ensurePrefix(PathDecorStorage.get(world), key, path);
             int i = 0;
             while (i < path.size()) {
                 ChunkPos chunk = new ChunkPos(path.get(i));

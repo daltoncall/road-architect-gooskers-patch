@@ -1,12 +1,12 @@
 package net.oxcodsnet.roadarchitect.handlers;
 
-import net.minecraft.core.BlockPos;
 import net.minecraft.core.Holder;
 import net.minecraft.core.Registry;
 import net.minecraft.core.registries.Registries;
 import net.minecraft.resources.ResourceKey;
 import net.minecraft.resources.ResourceLocation;
 import net.minecraft.server.MinecraftServer;
+import net.minecraft.server.level.ServerChunkCache;
 import net.minecraft.server.level.ServerLevel;
 import net.minecraft.server.level.ServerPlayer;
 import net.minecraft.tags.TagKey;
@@ -24,125 +24,114 @@ import java.util.HashSet;
 import java.util.List;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentLinkedQueue;
 
 /**
- * Controls execution of the road generation pipeline (platform-agnostic).
- * Fabric / NeoForge должны вызывать публичные onXxx(...) методы ниже,
- * сохраняя точные кейсы из исходного register().
+ * Stability-first structure trigger controller.
+ *
+ * <p>0.3.13 removes the old player-join/periodic radius scans. A target
+ * structure's own completed chunk is the trigger. The chunk callback only
+ * queues a tiny request; at most one request is resolved on a later server tick
+ * after the surrounding chunks are already completed LevelChunks.</p>
  */
 public final class RoadPipelineController {
     private static final Logger LOGGER = LoggerFactory.getLogger(RoadArchitect.MOD_ID + "/" + RoadPipelineController.class.getSimpleName());
 
-    /**
-     * Миры, для которых уже отработал INIT по событию генерации спавн-чанка.
-     */
-    private static final Set<ResourceKey<Level>> INITIALIZED = ConcurrentHashMap.newKeySet();
-
-    /**
-     * Кеш селекторов (ID и теги) из конфигурации, для быстрых проверок.
-     */
     private static final Set<ResourceLocation> TARGET_IDS = new HashSet<>();
     private static final Set<TagKey<Structure>> TARGET_TAGS = new HashSet<>();
     private static final Set<ResourceLocation> TARGET_DIMENSION_IDS = new HashSet<>();
 
-    /**
-     * Счётчик тиков для периодического триггера.
-     */
-    private static int tickCounter = 0;
+    private static final ConcurrentLinkedQueue<PendingStructureScan> PENDING = new ConcurrentLinkedQueue<>();
+    private static final Set<PendingStructureScan> PENDING_SET = ConcurrentHashMap.newKeySet();
+    private static final int MAX_PENDING_POLLS_PER_TICK = 4;
 
     private RoadPipelineController() {
     }
 
-    /**
-     * Вызывать при старте сервера/мода (однократно), чтобы закешировать селекторы.
-     */
     public static void init() {
         cacheStructureSelectors();
-        tickCounter = 0;
-        DebugLog.info(LOGGER, "RoadPipelineController initialized (selectors cached)");
+        PENDING.clear();
+        PENDING_SET.clear();
+        DebugLog.info(LOGGER, "RoadPipelineController initialized (post-load structure triggers)");
     }
 
-    /**
-     * Вызывать при обновлении конфига — перекешируем селекторы.
-     */
     public static void refreshStructureSelectorCache() {
         cacheStructureSelectors();
         DebugLog.info(LOGGER, "RoadPipelineController reloaded selectors from config");
     }
 
-    /* ───────────────────────── Точные кейсы из исходного register() ───────────────────────── */
-
-    /**
-     * 1) Генерация спавн-чанка ВПЕРВЫЕ → INIT.
-     */
+    /** Legacy hook retained for platform compatibility; CHUNK_LOAD handles discovery. */
     public static void onSpawnChunkGenerated(ServerLevel world, ChunkAccess chunk) {
-        if (!isDimensionEnabled(world.dimension())) return;
-
-        ChunkPos spawnChunk = new ChunkPos(world.getSharedSpawnPos());
-        if (!chunk.getPos().equals(spawnChunk)) return;
-
-        if (INITIALIZED.add(world.dimension())) {
-            DebugLog.info(LOGGER, "Spawn chunk {} generated in {}, starting INIT pipeline",
-                    chunk.getPos(), world.dimension().location());
-            PipelineRunner.runPipeline(world, world.getSharedSpawnPos(), PipelineRunner.PipelineMode.INIT);
-        }
+        onChunkGenerated(world, chunk);
     }
 
     /**
-     * 2) Генерация ЛЮБОГО чанка; если внутри есть целевая структура → CHUNK.
+     * CHUNK_LOAD hot path: only inspect this chunk's already-created structure
+     * starts and queue a later post-load scan when one matches.
      */
     public static void onChunkGenerated(ServerLevel world, ChunkAccess chunk) {
         if (!isDimensionEnabled(world.dimension())) return;
         if (!containsTargetStructure(world, chunk)) return;
 
-        BlockPos center = chunk.getPos().getMiddleBlockPosition(0);
-        DebugLog.info(LOGGER, "Chunk {} generated with target structure, starting CHUNK pipeline", chunk.getPos());
-        PipelineRunner.runPipeline(world, center, PipelineRunner.PipelineMode.CHUNK);
-    }
-
-    /**
-     * 3) Игрок вошёл на сервер → PERIODIC (как в исходнике).
-     */
-    public static void onPlayerJoin(ServerPlayer player) {
-        ServerLevel world = (ServerLevel) player.level();
-        if (!isDimensionEnabled(world.dimension())) return;
-
-        BlockPos pos = player.blockPosition();
-        DebugLog.info(LOGGER, "Player {} joined at {}, starting PERIODIC pipeline",
-                player.getName().getString(), pos);
-        PipelineRunner.runPipeline(world, pos, PipelineRunner.PipelineMode.PERIODIC);
-    }
-
-    /**
-     * 4) Периодический триггер раз в N секунд (из конфига) – START_SERVER_TICK.
-     */
-    public static void onServerTick(MinecraftServer server) {
-        int intervalTicks = Math.max(1, RoadArchitect.CONFIG.pipelineIntervalSeconds() * 20);
-        tickCounter++;
-        if (tickCounter < intervalTicks) return;
-        tickCounter = 0;
-
-        for (ServerPlayer player : server.getPlayerList().getPlayers()) {
-            Level w = player.level();
-            if (!isDimensionEnabled(w.dimension())) continue;
-
-            BlockPos pos = player.blockPosition();
-            DebugLog.info(LOGGER, "Periodic trigger at player {} pos {}, starting PERIODIC pipeline",
-                    player.getName().getString(), pos);
-            PipelineRunner.runPipeline((ServerLevel) w, pos, PipelineRunner.PipelineMode.PERIODIC);
+        ChunkPos pos = chunk.getPos();
+        PendingStructureScan pending = new PendingStructureScan(world, pos.x, pos.z);
+        if (PENDING_SET.add(pending)) {
+            PENDING.offer(pending);
+            DebugLog.info(LOGGER, "Target structure chunk {} queued for post-load road discovery", pos);
         }
     }
 
-    /**
-     * 5) Остановка сервера → чистим флаг и состояние контроллера.
-     */
-    public static void onServerStopping() {
-        INITIALIZED.clear();
-        tickCounter = 0;
-        DebugLog.info(LOGGER, "Server stopping, state cleared");
+    /** No full scan on login anymore. Loaded chunks discover themselves. */
+    public static void onPlayerJoin(ServerPlayer player) {
+        // Intentionally empty in 0.3.13.
     }
 
-    /* ─────────────────────────── Вспомогательное ─────────────────────────── */
+    /**
+     * Processes at most one ready target-structure trigger. This replaces the
+     * old every-N-seconds scan around every player.
+     */
+    public static void onServerTick(MinecraftServer server) {
+        for (int i = 0; i < MAX_PENDING_POLLS_PER_TICK; i++) {
+            PendingStructureScan pending = PENDING.poll();
+            if (pending == null) return;
+            PENDING_SET.remove(pending);
+
+            ServerLevel world = pending.world();
+            if (world == null || world.getServer() != server) continue;
+            if (!isDimensionEnabled(world.dimension())) continue;
+
+            if (!scanAreaReady(world, pending.chunkX(), pending.chunkZ())) {
+                // Rotate not-ready structure work instead of allowing the head
+                // entry to starve another already-loaded target behind it.
+                if (PENDING_SET.add(pending)) PENDING.offer(pending);
+                continue;
+            }
+
+            // Radius 1 is sufficient because the trigger chunk already proved
+            // that a configured target structure starts here.
+            PipelineRunner.runPipeline(world,
+                    new ChunkPos(pending.chunkX(), pending.chunkZ()).getMiddleBlockPosition(0),
+                    PipelineRunner.PipelineMode.CHUNK);
+            return;
+        }
+    }
+
+    public static void onServerStopping() {
+        PENDING.clear();
+        PENDING_SET.clear();
+        DebugLog.info(LOGGER, "Server stopping, post-load structure queue cleared");
+    }
+
+    private static boolean scanAreaReady(ServerLevel world, int chunkX, int chunkZ) {
+        ServerChunkCache chunks = world.getChunkSource();
+        if (chunks == null) return false;
+        for (int dx = -2; dx <= 2; dx++) {
+            for (int dz = -2; dz <= 2; dz++) {
+                if (chunks.getChunkNow(chunkX + dx, chunkZ + dz) == null) return false;
+            }
+        }
+        return true;
+    }
 
     private static void cacheStructureSelectors() {
         TARGET_IDS.clear();
@@ -197,10 +186,12 @@ public final class RoadPipelineController {
     }
 
     private static boolean containsTargetStructure(ServerLevel world, ChunkAccess chunk) {
-        if (!chunk.hasAnyStructureReferences()) return false;
+        // Structure starts are independent of their reference map.
+        if (chunk.getAllStarts().isEmpty()) return false;
 
         Registry<Structure> registry = world.registryAccess().registryOrThrow(Registries.STRUCTURE);
         for (StructureStart start : chunk.getAllStarts().values()) {
+            if (!start.isValid()) continue;
             Structure structure = start.getStructure();
             ResourceLocation id = registry.getKey(structure);
             if (id != null && TARGET_IDS.contains(id)) return true;
@@ -213,5 +204,8 @@ public final class RoadPipelineController {
             }
         }
         return false;
+    }
+
+    private record PendingStructureScan(ServerLevel world, int chunkX, int chunkZ) {
     }
 }

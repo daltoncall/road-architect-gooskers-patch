@@ -3,6 +3,9 @@ package net.oxcodsnet.roadarchitect.worldgen.style;
 import java.util.ArrayList;
 import java.util.List;
 import net.minecraft.util.RandomSource;
+import net.minecraft.util.Mth;
+import net.minecraft.core.BlockPos;
+import net.minecraft.world.level.block.Blocks;
 import net.minecraft.world.level.block.state.BlockState;
 
 /**
@@ -35,11 +38,17 @@ public final class BlockPalette {
         return this.entries.get(0).state;
     }
 
+    /** Overlapping post-load strokes must resolve a cell to the same material. */
+    public BlockState pickForCell(long worldSeed,BlockPos pos) {
+        return pick(RandomSource.create(worldSeed ^ Mth.getSeed(pos)));
+    }
+
     public static final class Builder {
         private final List<Entry> entries = new ArrayList<>();
         private int totalWeight;
 
         public Builder add(BlockState state, int weight) {
+            if (state == null || weight <= 0 || state.is(Blocks.STRUCTURE_VOID) || state.is(Blocks.BARRIER)) return this;
             this.entries.add(new Entry(state, weight));
             this.totalWeight += weight;
             return this;

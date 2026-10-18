@@ -68,10 +68,16 @@ extends Feature<RoadFeatureConfig> {
     }
 
     public static void buildRoadStripe(WorldGenLevel world, List<BlockPos> pts, int halfWidth, RandomSource random, RoadFeatureConfig.GenerationPhase phase) {
+        buildRoadStripe(world, pts, 0, pts.size(), halfWidth, random, phase);
+    }
+
+    /** Keep the full path for tangent geometry while writing only the budgeted slice. */
+    public static void buildRoadStripe(WorldGenLevel world, List<BlockPos> pts, int from, int to,
+                                      int halfWidth, RandomSource random, RoadFeatureConfig.GenerationPhase phase) {
         boolean finalizePhase = phase == RoadFeatureConfig.GenerationPhase.FINALIZE;
         int clearanceHalfWidth = halfWidth + 0;
         Registry biomeRegistry = finalizePhase ? world.registryAccess().registryOrThrow(Registries.BIOME) : null;
-        for (int i = 0; i < pts.size(); ++i) {
+        for (int i = Math.max(0, from); i < Math.min(to, pts.size()); ++i) {
             BlockPos p = pts.get(i);
             RoadFeature.cleanupLegacyMarkers(world, p, halfWidth + LEGACY_MARKER_RADIUS_EXTRA);
             int prevIdx = Math.max(0, i - 2);
@@ -112,7 +118,7 @@ extends Feature<RoadFeatureConfig> {
                     }
                     Holder biome = world.getBiome(roadPos);
                     RoadStyle style = RoadStyles.forBiome((Registry<Biome>)biomeRegistry, (Holder<Biome>)biome);
-                    BlockState roadState = style.palette().pick(random);
+                    BlockState roadState = style.palette().pickForCell(world.getSeed(),roadPos);
                     RoadFeature.placeRoad(world, roadPos, roadState);
                     PreparationEntry groundEntry = PREPARATION_BACKUP.remove(packedPos);
                     if (groundEntry != null) {
@@ -368,6 +374,8 @@ extends Feature<RoadFeatureConfig> {
     }
 
     private static void placeRoad(WorldGenLevel world, BlockPos pos, BlockState stateRoad) {
+        // Even a misconfigured palette must never place invisible marker blocks.
+        if (stateRoad == null || stateRoad.is(Blocks.STRUCTURE_VOID) || stateRoad.is(Blocks.BARRIER)) return;
         // FINALIZE runs after vegetation. Clearing here catches trees that were
         // generated after PREPARE and prevents orphaned trunks or canopies.
         GooskerRoadDropCleanup.mark(world, pos);
@@ -376,7 +384,8 @@ extends Feature<RoadFeatureConfig> {
             // PREPARE never changed this block, so the safest rollback is no write.
             return;
         }
-        world.setBlock(pos, GooskerRoadSurfaceRules.preserveOriginalProperties(pos, stateRoad), 2);
+        BlockState target=GooskerRoadSurfaceRules.preserveOriginalProperties(pos,stateRoad);
+        if(!world.getBlockState(pos).equals(target)) world.setBlock(pos,target,2);
         // Optional Terrain Slabs integration. This class uses reflection and is
         // a no-op when terrain_slabs is not installed. Keeping the hook here
         // avoids a Mixin against our own RoadFeature class.
@@ -392,7 +401,7 @@ extends Feature<RoadFeatureConfig> {
         return !world.getBlockState(pos).getFluidState().is(FluidTags.WATER);
     }
 
-    private static List<BlockPos> collectLandPoints(WorldGenLevel world, List<BlockPos> pts, int from, int to) {
+    public static List<BlockPos> collectLandPoints(WorldGenLevel world, List<BlockPos> pts, int from, int to) {
         int n = pts.size();
         int extFrom = Math.max(0, from - 1);
         int extTo = Math.min(n, to + 1);
@@ -414,6 +423,10 @@ extends Feature<RoadFeatureConfig> {
     }
 
     public boolean place(FeaturePlaceContext<RoadFeatureConfig> ctx) {
+        // Older datapacks can still reference the registered placed features.
+        // Never let those references mutate a vanilla/DH generation region.
+        // Current roads are built by the loaded ServerLevel tick worker.
+        if(!(ctx.level() instanceof ServerLevel)) return false;
         ServerLevel serverWorld = ctx.level().getLevel();
         if (serverWorld == null) {
             return false;
@@ -535,6 +548,85 @@ extends Feature<RoadFeatureConfig> {
             }
         }
         return placedAny;
+    }
+
+
+    /** Decorations for a single post-load point; no whole-path checksum on every tick. */
+    public static void decoratePostLoadPoint(ServerLevel world, List<BlockPos> pts, String pathKey,
+                                             int from, int to, int halfWidth, RandomSource random) {
+        if (!RoadArchitect.CONFIG.deterministicDecorations()) return;
+        PathDecorStorage decor = PathDecorStorage.get(world);
+        double[] S = decor.getPrefix(pathKey);
+        if (S == null || S.length != pts.size()) S = PathDecorUtil.ensurePrefix(decor, pathKey, pts);
+        int erosion = Math.min(16, Math.max(0, RoadArchitect.CONFIG.maskErosion()));
+        int maskFrom = Math.max(0, from - erosion);
+        int maskTo = Math.min(pts.size(), to + erosion);
+        // A marker at a chunk edge waits for already-loaded mask neighbors; never pull chunks in.
+        for (int j = maskFrom; j < maskTo; j++) {
+            BlockPos q = pts.get(j);
+            if (world.getChunkSource().getChunkNow(q.getX() >> 4, q.getZ() >> 4) == null) return;
+        }
+        PathDecorUtil.fillGroundMask(decor, pathKey, world, pts, maskFrom, maskTo);
+        int lampInterval = Math.max(0, RoadArchitect.CONFIG.lampInterval());
+        int sideInterval = Math.max(0, RoadArchitect.CONFIG.sideDecorationInterval());
+        boolean det = true;
+        Registry<Biome> biomeRegistry = world.registryAccess().registryOrThrow(Registries.BIOME);
+        List<PathDecorUtil.Marker> marks;
+        byte[] landMask;
+        int i, prevIdx, nextIdx;
+        BlockPos p;
+        Vec3 dir;
+        double nx, nz;
+            if (det && lampInterval > 0) {
+                int markerPhase = PathDecorUtil.phaseFor(pathKey, lampInterval);
+                marks = PathDecorUtil.markersInWindow(S, from, to, lampInterval, markerPhase);
+                landMask = decor.getGroundMask(pathKey);
+                for (PathDecorUtil.Marker m : marks) {
+                    i = m.index();
+                    p = pts.get(i);
+                    if (!PathDecorUtil.erodedAccept(landMask, i, erosion, (byte)1)) continue;
+                    p = RoadFeature.resolveRoadSurface(world, p);
+                    if (p == null) continue;
+                    prevIdx = Math.max(0, i - 2);
+                    nextIdx = Math.min(pts.size() - 1, i + 2);
+                    dir = new Vec3((double)(pts.get(nextIdx).getX() - pts.get(prevIdx).getX()), 0.0, (double)(pts.get(nextIdx).getZ() - pts.get(prevIdx).getZ())).normalize();
+                    nx = dir.x;
+                    nz = dir.z;
+                    boolean leftFirst = PathDecorUtil.detBool(pathKey, m.k());
+                    Holder biomeAtP = world.getBiome(p);
+                    LampPostDecoration resolved = LampPostConfigResolver.resolve(world, (Holder<Biome>)biomeAtP, null, pathKey, m.k());
+                    if (resolved == null) continue;
+                    RoadFeature.placeLampDet(world, p, nx, nz, halfWidth, resolved, leftFirst, random);
+                }
+            }
+            if (!det || sideInterval <= 0) return;
+            int markerPhase = PathDecorUtil.phaseFor(pathKey, sideInterval);
+            marks = PathDecorUtil.markersInWindow(S, from, to, sideInterval, markerPhase);
+            landMask = decor.getGroundMask(pathKey);
+            for (PathDecorUtil.Marker m : marks) {
+                i = m.index();
+                if (!PathDecorUtil.erodedAccept(landMask, i, erosion, (byte)1)) continue;
+                p = pts.get(i);
+                p = RoadFeature.resolveRoadSurface(world, p);
+                if (p == null) continue;
+                prevIdx = Math.max(0, i - 2);
+                nextIdx = Math.min(pts.size() - 1, i + 2);
+                dir = new Vec3((double)(pts.get(nextIdx).getX() - pts.get(prevIdx).getX()), 0.0, (double)(pts.get(nextIdx).getZ() - pts.get(prevIdx).getZ())).normalize();
+                nx = dir.x;
+                nz = dir.z;
+                RoadStyle styleAtP = RoadStyles.forBiome((Registry<Biome>)biomeRegistry, (Holder<Biome>)world.getBiome(p));
+                ArrayList<Decoration> sideDecos = new ArrayList<Decoration>();
+                for (Decoration d : styleAtP.decorations()) {
+                    if (d instanceof LampPostDecoration) continue;
+                    sideDecos.add(d);
+                }
+                if (sideDecos.isEmpty()) continue;
+                int choice = PathDecorUtil.detInt(pathKey, m.k(), sideDecos.size());
+                Decoration chosen = (Decoration)sideDecos.get(choice);
+                boolean leftSide = PathDecorUtil.detBool(pathKey, m.k());
+                int length = 1 + PathDecorUtil.detInt(pathKey, m.k() ^ 0x55AA55AAL, 3);
+                RoadFeature.placeSideDet(world, p, nx, nz, halfWidth, chosen, leftSide, length, RandomSource.create((long)(m.k() ^ (long)pathKey.hashCode())));
+            }
     }
 
     private static enum PreparationRole {

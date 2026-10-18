@@ -176,10 +176,16 @@ public final class PathDecorUtil {
     public static List<Marker> markersInWindow(double[] S, int from, int to, int step, int phase) {
         List<Marker> out = new ArrayList<>();
         if (S == null || S.length == 0 || step <= 0 || to <= from) return out;
-        double sFrom = S[Math.max(0, from)];
-        double sTo = S[Math.max(0, Math.min(to - 1, S.length - 1))];
-        long[] kr = kRange(sFrom, sTo, step, phase);
-        long kMin = kr[0], kMax = kr[1];
+        // A marker belongs to the first point at/after its distance. Use
+        // integer ordinal boundaries for (previous distance, current distance];
+        // nextUp(0)/step can underflow and duplicate the zero-distance marker.
+        int start = Math.max(0, Math.min(from, S.length));
+        int end = Math.max(start, Math.min(to, S.length));
+        if (start >= end) return out;
+        long kMin = start == 0
+                ? (long) Math.ceil((S[0] - phase) / step)
+                : (long) Math.floor((S[start - 1] - phase) / step) + 1;
+        long kMax = (long) Math.floor((S[end - 1] - phase) / step);
         if (kMax < kMin) return out;
         for (long k = kMin; k <= kMax; k++) {
             double m = phase + (double) k * (double) step;

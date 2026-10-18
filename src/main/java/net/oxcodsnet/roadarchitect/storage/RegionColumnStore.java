@@ -195,7 +195,7 @@ final class RegionColumnStore {
         }
     }
 
-    private void flushRegion(long regionKey, RegionData region) {
+    private synchronized void flushRegion(long regionKey, RegionData region) {
         Long2ObjectMap<ColumnRecord> snapshot = region.snapshotIfDirty();
         if (snapshot == null) {
             return;

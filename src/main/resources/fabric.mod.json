@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "roadarchitect",
   "version": "${version}",
-  "name": "Road Architect: Goosker's Patch alpha 0.2.13",
+  "name": "Road Architect: Goosker's Patch ${version}",
   "description": "Unofficial RoadArchitect 1.6.6 stability and terrain-generation patch for Fabric 1.20.1.",
   "authors": [
     "0xCoDSnet"
@@ -33,14 +33,17 @@
     ]
   },
   "depends": {
-    "fabricloader": ">=${loader_version}",
-    "minecraft": "~${minecraft_version}",
+    "fabricloader": ">=0.16.14",
+    "minecraft": "~1.20.1",
     "java": ">=17",
     "fabric-api": "*",
-    "cloth-config2": ">=${cloth_config_version}"
+    "cloth-config2": ">=11.1.136"
   },
   "suggests": {
-    "modmenu": "${modmenu_version}",
+    "modmenu": "7.2.2",
     "terrain_slabs": "*"
-  }
+  },
+  "mixins": [
+    "roadarchitect.tree-protection.mixins.json"
+  ]
 }

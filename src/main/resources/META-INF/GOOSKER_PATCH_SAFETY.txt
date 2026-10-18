@@ -1,10 +1,11 @@
-Road Architect: Goosker's Patch alpha 0.2.9 safety invariants
+0.3.13: Post-load stability release; no biome injection; one point/tick; Structure Void and Barrier guarded.
+Road Architect: Goosker's Patch 0.3.12 safety invariants
 
 1. Road preparation is in-memory only. No Structure Void, Barrier, Bedrock, or other physical staging block may be placed.
 2. Legacy Structure Void and Barrier markers remain eligible for cleanup; new construction must never create them.
 3. No generated net/minecraft stub classes may be packaged in the release JAR.
 4. Structure discovery and backfill must remain loaded-chunk-only and must not force-load chunks.
-5. Water and vanilla ice remain road vetoes. Generated-building protection remains above road priority.
+5. Water and lava remain road vetoes. Vanilla ice/packed ice/blue ice/frosted ice may support configured ice roads. Generated-building protection remains above road priority.
 6. Ordinary terrain, natural vegetation, and Terrain Slabs remain road-replaceable.
 7. Snow, flowers, and preserved soft overlays must not be destroyed merely because a road passes underneath them.
 8. PREPARE/CLEARANCE is confined to the actual physical trail footprint; no extra excavation/restoration ring is permitted.
@@ -17,3 +18,15 @@ Road Architect: Goosker's Patch alpha 0.2.9 safety invariants
 15. A non-road cell must never be removed or restored by the preparation pipeline.
 16. A road cell must resolve to exposed, immediately supported natural terrain and must not be supported by building blocks.
 17. Isolated leaves, leaf litter, flowers, snow, and ordinary ground vegetation are preserved.
+18. Structure endpoint scans and loaded-world backfill must use completed chunks (`getChunkNow`) and must never wait for or force-load a chunk.
+19. Pipeline boundaries must contain ordinary exceptions and linkage/API mismatch errors without swallowing fatal VM errors.
+20. Any parent-chain/path reconstruction walk must have cycle and hop-budget guards.
+21. Automatic Road Architect background parallelism must remain bounded; explicit user configuration may override the automatic cap.
+22. In-flight cache work must not be synchronously joined from road-generation/server-tick code.
+23. Slab transition resolution must use the one-time cached block-to-slab map during road placement; registry scans/reflection must not occur per road cell.
+24. Countered Terrain Slabs remains optional; its mappings take priority when present, and Countered API failure must not disable generic registered-slab matching.
+25. Whole-tree cleanup requires positive natural-tree evidence: an unstripped trunk plus a bounded canopy of non-persistent leaves.
+26. Player-persistent leaves fail tree identification closed; ambiguous timber must not be deleted as a tree.
+27. Tree cleanup is limited to a seven-block horizontal radius and a 48-block vertical window.
+28. Destructive log cleanup follows only the bounded connected natural-tree skeleton; it must not sweep every log in the surrounding cube.
+29. Tree attachments are removed only when connected to positively identified natural tree material; crafted beehives remain excluded.

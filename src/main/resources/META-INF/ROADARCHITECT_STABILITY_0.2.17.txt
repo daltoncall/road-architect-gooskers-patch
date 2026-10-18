@@ -1,0 +1,15 @@
+Road Architect Goosker 0.3.10 stabilization + tree/slab compatibility audit
+- no waiting on in-flight height snapshot futures
+- structure candidate planning is sequential and capped at 8192 candidates
+- pipeline catches LinkageError at the outer boundary
+- loaded-world backfill requires completed chunks via getChunkNow
+- path parent reconstruction has cycle/missing-parent/hop guards
+- automatic async pool capped at 8 workers
+- cache region flushes serialized to reduce atomic-move races
+- backfill reflection initialization fails closed instead of crashing class init
+- alpha-0.2.16 entrance resolution remains getChunkNow/LevelChunk-only and defers incomplete footprints
+- 0.3.9 slab compatibility uses a one-time cached map; Countered mappings have priority and generic registered slabs fill the rest
+- Countered API failure is isolated from generic slab matching
+
+- 0.3.10 vegetation/bee/slab live-world reads are getChunkNow-only; missing chunks are skipped rather than requested
+- 0.3.10 tree cleanup includes bounded leaves/vines/cocoa/propagules/mangrove-root removal and keeps structure protection ahead of deletion

@@ -105,10 +105,10 @@ public final class ChunkHeightGenerator {
                                 int localX = globalX & (chunkSide - 1);
                                 int localZ = globalZ & (chunkSide - 1);
                                 int index = localZ * chunkSide + localX;
-                                BlockState stateAtPos = sampler.sampleBlockStateDirect();
                                 if (resolved[index]) {
                                     continue;
                                 }
+                                BlockState stateAtPos = sampler.sampleBlockStateDirect();
                                 if (stateAtPos == null) {
                                     stateAtPos = defaultBlock;
                                 }

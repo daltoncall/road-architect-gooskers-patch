@@ -71,8 +71,11 @@ public final class PipelineRunner {
                 default -> {
                     setStage(PipelineStage.SCANNING_STRUCTURES);
                     try (PipelineProfiler.Section stage = PipelineProfiler.openSection("stage.structure_scan")) {
-                        StructureScanManager.scan(world, mode.reason(), center,
-                                RoadArchitect.CONFIG.chunkGenerateScanRadius());
+                        // CHUNK triggers are now raised only by a chunk that already
+                        // contains a target structure. Radius 1 is enough to resolve
+                        // that local start and avoids the old synchronous 20-chunk scan.
+                        int radius = mode == PipelineMode.CHUNK ? 1 : RoadArchitect.CONFIG.chunkGenerateScanRadius();
+                        StructureScanManager.scan(world, mode.reason(), center, radius);
                     }
 
                     setStage(PipelineStage.PATH_FINDING);
@@ -82,8 +85,8 @@ public final class PipelineRunner {
                     }
                 }
             }
-        } catch (Exception e) {
-            LOGGER.error("Pipeline failure", e);
+        } catch (Exception | LinkageError e) {
+            LOGGER.error("Pipeline failure (operation aborted safely)", e);
         } finally {
             if (profiler != null) {
                 profiler.close();

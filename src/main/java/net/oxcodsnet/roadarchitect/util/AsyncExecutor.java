@@ -33,13 +33,14 @@ public final class AsyncExecutor {
             int configured = RAConfigHolder.get().debugAsyncThreads();
             int parallelism;
             if (configured > 0) {
-                parallelism = configured;
+                // Stability-first cap: even an old config asking for many workers
+                // cannot make Road Architect compete with vanilla/DH worldgen.
+                parallelism = Math.max(1, Math.min(2, configured));
             } else {
-                // auto: leave 2 cores for the OS / MC main thread / vanilla
-                // worldgen workers. Previously hardcoded to N-1, which
-                // pegged 16-core machines to 100 % under Distant Horizons
-                // (see GH #29).
-                parallelism = Math.max(1, Runtime.getRuntime().availableProcessors() - 2);
+                // One background worker is intentionally conservative. Path finding
+                // may take longer, but it cannot fan out across the CPU and starve
+                // Distant Horizons or the integrated server.
+                parallelism = 1;
             }
             LOGGER.info("AsyncExecutor pool initialized with parallelism={} (configured={}, available={})",
                     parallelism, configured, Runtime.getRuntime().availableProcessors());

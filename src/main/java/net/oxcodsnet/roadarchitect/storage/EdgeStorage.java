@@ -2,6 +2,7 @@ package net.oxcodsnet.roadarchitect.storage;
 
 import net.oxcodsnet.roadarchitect.storage.components.Node;
 import net.oxcodsnet.roadarchitect.util.KeyUtil;
+import net.oxcodsnet.roadarchitect.util.GooskerDegreeLimiter;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import net.minecraft.nbt.CompoundTag;
@@ -62,6 +63,13 @@ public class EdgeStorage {
      */
     public boolean add(Node a, Node b) {
         if (a.id().equals(b.id())) return false; // нельзя соединять узел сам с собой
+
+        // Goosker patch: a generated structure may participate in at most two
+        // road edges. This keeps hubs from spraying 3-4 nearly parallel roads
+        // into the same build and naturally encourages chain-like networks.
+        if (!GooskerDegreeLimiter.hasRoom(this, a, b)) {
+            return false;
+        }
 
         String edgeId = KeyUtil.edgeKey(a.id(), b.id());
         edges.put(edgeId, new Edge(a.id(), b.id(), Status.NEW));

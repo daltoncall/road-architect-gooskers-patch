@@ -1,0 +1,4 @@
+0.3.14 performance audit. Post-generation only, one point/tick.
+Tree follow-up candidates replace extra volume scans. Per-point caches expire before decorations.
+Natural terrain-height cache and pending-path index. Door-free sections skipped.
+No Structure Void/Barrier placement. See PERFORMANCE_AUDIT.md and STABILITY_AUDIT.md.

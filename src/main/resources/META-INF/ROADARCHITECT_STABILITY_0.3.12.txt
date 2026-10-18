@@ -1,0 +1,10 @@
+Road Architect: Goosker's Patch 0.3.12
+
+Natural-tree cleanup invariants:
+- 7-block horizontal cleanup radius / 48-block vertical cap.
+- Positive detection requires unstripped trunk + >=9 non-persistent leaves in a bounded 5x5 / 30-block scan.
+- Persistent leaves fail closed.
+- Connected-log traversal capped at 2048 logs.
+- Connected attachment traversal capped at 4096 blocks.
+- Live ServerLevel reads use getChunkNow and never force-load neighboring chunks.
+- Tree Harvester is a behavioral reference only, not a runtime dependency.

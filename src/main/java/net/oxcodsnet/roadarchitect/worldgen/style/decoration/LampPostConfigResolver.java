@@ -9,6 +9,7 @@ import net.minecraft.resources.ResourceLocation;
 import net.minecraft.world.level.WorldGenLevel;
 import net.minecraft.world.level.biome.Biome;
 import net.minecraft.world.level.block.Block;
+import net.minecraft.world.level.block.Blocks;
 import net.minecraft.world.level.block.state.BlockState;
 import net.oxcodsnet.roadarchitect.config.records.LampPostConfigEntry;
 import net.oxcodsnet.roadarchitect.config.RAConfig;
@@ -127,6 +128,7 @@ public final class LampPostConfigResolver {
         }
         return BuiltInRegistries.BLOCK.getOptional(id)
                 .map(Block::defaultBlockState)
+                .filter(state -> !state.is(Blocks.STRUCTURE_VOID) && !state.is(Blocks.BARRIER))
                 .orElseGet(() -> {
                     LOGGER.warn("Lamp post override {} '{}' is not registered", role, raw);
                     return null;

@@ -1,6 +1,63 @@
-Road Architect: Goosker's Patch alpha 0.2.9
+0.3.13: Post-load stability release; no biome injection; one point/tick; Structure Void and Barrier guarded.
+Road Architect: Goosker's Patch 0.3.12
+- Positive natural-tree detection based on unstripped trunks + non-persistent leaves.
+- Seven-block tree cleanup radius; connected natural logs/leaves/attachments only.
+- No Tree Harvester runtime dependency.
+
+Road Architect: Goosker's Patch 0.3.10
+
+0.3.10 audit additions:
+- Wider bounded removal of road-intersecting trees/canopies (9-block radius, 48-block vertical window).
+- Removes tree-attached vines, cocoa, propagules, mangrove roots, natural bee nests, and unsupported canopy snow. Crafted beehives remain untouched.
+- Live ServerLevel vegetation/bee/slab reads are getChunkNow-only and never force a chunk load.
+- Structure Void remains legacy-cleanup-only; no new staging blocks are placed.
+
+Road Architect: Goosker's Patch 0.3.9
 Based on RoadArchitect 1.6.6 Fabric 1.20.1 (Apache-2.0).
 Upstream source: https://github.com/Shadscure/RoadArchitect
+
+
+0.3.9 cached slab compatibility
+-------------------------------
+- Builds one block-to-slab cache from the registered blocks after registries are ready.
+- Countered Terrain Slabs mappings are copied first and retain priority for terrain-specific slabs.
+- Vanilla and modded registered slabs fill any remaining matches, including wood planks and decorative blocks.
+- Road generation uses a constant-time cache lookup; it does not scan registries or reflect into Countered per road cell.
+- Countered remains optional; if its API changes, generic slab matching continues fail-safely.
+
+
+Alpha 0.2.17 stabilization audit
+--------------------------------
+- Removed blocking waits on in-flight height snapshot futures.
+- Removed common-pool submit+join structure planning; planning is sequential and capped.
+- Backfill now requires completed chunks via getChunkNow across a bounded safety margin.
+- Pipeline operations contain LinkageError/API mismatch failures instead of letting them escape the server tick.
+- Path parent reconstruction has cycle, missing-parent and hop-budget guards.
+- Backfill reflection initialization fails closed if internal hooks change.
+- Region cache flushes are serialized per store to reduce atomic-move races.
+- Automatic Road Architect async parallelism is capped at 8 workers.
+- No intentional road appearance/generation feature changes from alpha 0.2.16.
+
+Alpha 0.2.16 non-blocking entrance fix
+---------------------------------------
+- Structure doorway targeting reads completed LevelChunks only through getChunkNow.
+- Incomplete entrance-scan footprints are deferred instead of force-loaded or waited on.
+
+Alpha 0.2.15 entrances + snow + ice-road support
+----------------------------------------------------
+- Standalone generated structures now scan loaded blocks for low ground-floor
+  doors, compare both door sides for exterior openness/natural footing, and
+  move the road node to the closest safe 4-block-grid approach outside the
+  likely front entrance.
+- Terralith valley_lodge keeps its dedicated entrance resolver. Village/fort/
+  town/city complexes keep their broader locate anchor instead of picking one
+  random building door.
+- Structure graph nodes remain capped at two road connections.
+- Tree/canopy cleanup now removes only unsupported minecraft:snow layers left
+  floating after their leaf support was deleted. Supported ground snow stays.
+- Ice, packed ice, blue ice and frosted ice are valid road terrain so configured
+  ice-path palettes can generate across frozen surfaces. Water and lava remain
+  forbidden for road placement.
 
 Alpha 0.2.9 vegetation-drop cleanup
 ------------------------------------
@@ -99,7 +156,7 @@ Retained from earlier builds
 - Generated-structure protection.
 - In-memory preparation and legacy Structure Void/Barrier cleanup.
 - Ordinary terrain/Terrain Slabs road priority.
-- Water and ice avoidance; no buoy roads.
+- Water avoidance remains in force; frozen ice surfaces are valid road terrain for configured ice paths.
 - Snow/flower/soft-overlay preservation and grass-block property preservation.
 - Natural meander, graph deduplication, and parallel-road coalescing.
 

@@ -1,0 +1,19 @@
+0.3.17 / Fabric 1.20.1
+Final full source compile/remap/build: PASS (1m 3s)
+600 marker checks, performance, tree and chunk-update checks: PASS
+Unmodified 0.3.16 RoadFeature reference: repaint failure reproduced
+Reference repeated traversal: 144 setBlock calls, 109 actual state changes
+Patched repeated traversal: 0 setBlock calls, 0 state changes
+First patched traversal: 27 state changes; flower overlay preserved
+384 interleaved tree cells: 4 one-chunk bursts, <=128 candidates: PASS
+Six quiet ticks before chunk reuse; fair unloaded rotation; restart: PASS
+Pending tree footprint for finalization; legacy generation-region rejection: PASS
+96-block healthy/bare spruce and damaged single-trunk cleanup: PASS
+Player records, generated bounds, high timber attachments, persistent leaves: PASS
+Neighbor canopy, loaded-boundary, dedup, replacement protections: PASS
+Release version/entrypoints, mixin config/refmap, Java17 targets: PASS
+No repair command or regression-test classes in release: PASS
+0.3.17 live-world bootstrap, renderer and affected full-modpack world: NOT RUN
+DH recovery, full-pack chunk throughput and live placement tracking: UNVERIFIED
+Old unrecorded player poles identical to natural trunks remain ambiguous.
+JAR SHA-256: 9f22cfa9aef00e7ea2646b23745caab78f4bd4d816e6196e51d277f03e52c229

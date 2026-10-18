@@ -266,7 +266,9 @@ public final class RoadStyles {
             }
             HolderSet<Block> list = optional.get();
             for (Holder<Block> blockEntry : list) {
-                return blockEntry.value().defaultBlockState();
+                BlockState state = blockEntry.value().defaultBlockState();
+                if (state.is(Blocks.STRUCTURE_VOID) || state.is(Blocks.BARRIER)) continue;
+                return state;
             }
             LOGGER.warn("Road style {} tag '{}' had no blocks", role, raw);
             return null;
@@ -281,7 +283,8 @@ public final class RoadStyles {
             LOGGER.warn("Road style {} '{}' is not registered", role, raw);
             return null;
         }
-        return optional.get().defaultBlockState();
+        BlockState state = optional.get().defaultBlockState();
+        return state.is(Blocks.STRUCTURE_VOID) || state.is(Blocks.BARRIER) ? null : state;
     }
 
     private record ParsedStyle(List<String> selectors, RoadStyle style) {

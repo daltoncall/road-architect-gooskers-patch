@@ -3,41 +3,37 @@ package net.oxcodsnet.roadarchitect.fabric.events;
 import net.fabricmc.fabric.api.event.lifecycle.v1.ServerChunkEvents;
 import net.fabricmc.fabric.api.event.lifecycle.v1.ServerLifecycleEvents;
 import net.fabricmc.fabric.api.event.lifecycle.v1.ServerTickEvents;
-import net.fabricmc.fabric.api.networking.v1.ServerPlayConnectionEvents;
-import net.fabricmc.loader.api.FabricLoader;
 import net.minecraft.world.level.chunk.ChunkAccess;
 import net.oxcodsnet.roadarchitect.api.addon.RoadAddons;
 import net.oxcodsnet.roadarchitect.handlers.GooskerRoadBackfill;
 import net.oxcodsnet.roadarchitect.handlers.RoadPipelineController;
-import net.oxcodsnet.roadarchitect.util.DebugLog;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
 
+/** Fabric lifecycle bridge for the post-generation 0.3.13 pipeline. */
 public final class RoadPipelineFabricEvents {
-    private static final Logger LOGGER = LoggerFactory.getLogger((String)"roadarchitect/FabricEvents");
-
     private RoadPipelineFabricEvents() {
     }
 
     public static void register() {
         RoadPipelineController.init();
-        boolean dhPresent = FabricLoader.getInstance().isModLoaded("distanthorizons");
-        if (dhPresent) {
-            DebugLog.info(LOGGER, "Distant Horizons detected: skipping INIT pregen; pipeline will start on player join", new Object[0]);
-        }
+
         ServerChunkEvents.CHUNK_LOAD.register((world, chunk) -> {
-            if (!dhPresent) {
-                RoadPipelineController.onSpawnChunkGenerated(world, (ChunkAccess)chunk);
-            }
+            // Cheap notification only. No road placement, broad scans, cache
+            // snapshots, or forced chunk work is allowed in this callback.
             GooskerRoadBackfill.onChunkLoadAndPipeline(world, (ChunkAccess)chunk);
             RoadAddons.onChunkLoad(world, chunk.getPos());
+            net.oxcodsnet.roadarchitect.handlers.AutomaticRoadTreeCleanup.onChunkLoad(world,chunk.getPos());
         });
-        ServerPlayConnectionEvents.JOIN.register((handler, sender, server) -> RoadPipelineController.onPlayerJoin(handler.getPlayer()));
+
         ServerTickEvents.START_SERVER_TICK.register(server -> {
+            for(var world:server.getAllLevels()) net.oxcodsnet.roadarchitect.storage.TreeRemovalQueue.get(world).process(world);
             GooskerRoadBackfill.onServerTickAndPipeline(server);
+            net.oxcodsnet.roadarchitect.handlers.AutomaticRoadTreeCleanup.tick(server);
             RoadAddons.onServerTick(server);
         });
-        ServerLifecycleEvents.SERVER_STOPPING.register(server -> GooskerRoadBackfill.onServerStoppingAndPipeline());
+
+        ServerLifecycleEvents.SERVER_STOPPING.register(server -> {
+            net.oxcodsnet.roadarchitect.handlers.AutomaticRoadTreeCleanup.clear();
+            GooskerRoadBackfill.onServerStoppingAndPipeline();
+        });
     }
 }
-

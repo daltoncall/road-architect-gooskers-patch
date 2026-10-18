@@ -1,0 +1,5 @@
+Road Architect Goosker 0.3.13
+Post-generation only; no biome feature injection or chunk-load height snapshots.
+One centerline point per server tick with retained path tangent and deterministic decorations.
+Loaded-start discovery waits for entrance chunks. Structure Void/Barrier placement rejected.
+See STABILITY_AUDIT.md for verification and in-game testing limits.

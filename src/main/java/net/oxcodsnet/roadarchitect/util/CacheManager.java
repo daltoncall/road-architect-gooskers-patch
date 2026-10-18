@@ -1,6 +1,8 @@
 package net.oxcodsnet.roadarchitect.util;
 
 import java.util.Map;
+import com.github.benmanes.caffeine.cache.Cache;
+import com.github.benmanes.caffeine.cache.Caffeine;
 import java.util.OptionalInt;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
@@ -39,6 +41,7 @@ import org.slf4j.LoggerFactory;
 public final class CacheManager {
     private static final Logger LOGGER = LoggerFactory.getLogger((String)("roadarchitect/" + CacheManager.class.getSimpleName()));
     private static final Map<ResourceKey<Level>, WorldCacheState> STATES = new ConcurrentHashMap<ResourceKey<Level>, WorldCacheState>();
+    private static final Map<ServerLevel, Cache<Long, Integer>> NATURAL_HEIGHTS = new ConcurrentHashMap<>();
     private static final int CHUNK_SIDE = 16;
     private static final int COLUMNS_PER_CHUNK = 256;
 
@@ -73,6 +76,7 @@ public final class CacheManager {
     }
 
     private static void load(ServerLevel world) {
+        NATURAL_HEIGHTS.remove(world);
         CacheStorage storage = CacheStorage.open(world);
         CacheSettings settings = storage.settings();
         STATES.put((ResourceKey<Level>)world.dimension(), new WorldCacheState(world, storage, settings));
@@ -81,6 +85,7 @@ public final class CacheManager {
     }
 
     private static void save(ServerLevel world) {
+        NATURAL_HEIGHTS.remove(world);
         WorldCacheState state = STATES.remove(world.dimension());
         if (state != null) {
             state.flush();
@@ -205,10 +210,41 @@ public final class CacheManager {
             state.storage().putHeightIfAbsent(key, value);
             return value;
         }
+
+        // Prefer the already-completed LevelChunk. This is constant-time and
+        // never asks the chunk system to load/generate anything. Structure
+        // discovery in 0.3.13 waits for a 3x3 loaded area before calling here.
+        try {
+            var loadedChunk = world.getChunkSource().getChunkNow(x >> 4, z >> 4);
+            if (loadedChunk != null) {
+                Heightmap hm = loadedChunk.getOrCreateHeightmapUnprimed(Heightmap.Types.MOTION_BLOCKING_NO_LEAVES);
+                int value = hm.getFirstAvailable(x & 15, z & 15);
+                CacheManager.state(world).storage().putHeightIfAbsent(key, value);
+                return value;
+            }
+        } catch (Throwable ignored) {
+        }
+
         return CacheManager.getHeight(world, key, () -> {
             ChunkGenerator gen = world.getChunkSource().getGenerator();
             RandomState cfg = world.getChunkSource().randomState();
             return gen.getBaseHeight(x, z, Heightmap.Types.WORLD_SURFACE_WG, (LevelHeightAccessor)world, cfg);
+        });
+    }
+
+
+    /** Natural terrain only: live roof/canopy heights never enter this cache. */
+    public static int getNaturalHeight(ServerLevel world, int x, int z) {
+        long key = hash(x, z);
+        Cache<Long, Integer> cache = NATURAL_HEIGHTS.computeIfAbsent(world,
+                ignored -> Caffeine.newBuilder().maximumSize(131072).build());
+        return cache.get(key, ignored -> {
+            WorldCacheState state = state(world);
+            ChunkHeightSnapshot snapshot = state.getChunkSnapshot(new ChunkPos(x >> 4, z >> 4).toLong());
+            if (snapshot != null) return snapshot.get(x & 15, z & 15);
+            var chunks = world.getChunkSource();
+            return chunks.getGenerator().getBaseHeight(x, z, Heightmap.Types.WORLD_SURFACE_WG,
+                    world, chunks.randomState());
         });
     }
 
@@ -259,65 +295,19 @@ public final class CacheManager {
         return new BlockPos((int)(k >> 32), 0, (int)k);
     }
 
+    /**
+     * 0.3.13: intentionally no-op. Previous builds walked all 256 columns and
+     * queued an async cache write for every loaded chunk. Distant Horizons can
+     * load/generate thousands of chunks, so attaching Road Architect work here
+     * caused queue pressure and server-thread spikes. Heights are now populated
+     * lazily only when a road/path calculation actually needs them.
+     */
     public static void onChunkLoad(ServerLevel world, ChunkAccess chunk) {
-        if (world.isClientSide()) {
-            return;
-        }
-        WorldCacheState state = STATES.get(world.dimension());
-        if (state == null) {
-            return;
-        }
-        ChunkPos pos = chunk.getPos();
-        int startX = pos.getMinBlockX();
-        int startZ = pos.getMinBlockZ();
-        int minY = state.minWorldY();
-        Heightmap wg = chunk.getOrCreateHeightmapUnprimed(Heightmap.Types.MOTION_BLOCKING_NO_LEAVES);
-        Heightmap surface = chunk.getOrCreateHeightmapUnprimed(Heightmap.Types.MOTION_BLOCKING_NO_LEAVES);
-        if (wg == null && surface == null) {
-            return;
-        }
-        if (wg == null) {
-            wg = surface;
-        }
-        if (surface == null) {
-            surface = wg;
-        }
-        int[] snapshot = new int[256];
-        for (int localZ = 0; localZ < 16; ++localZ) {
-            for (int localX = 0; localX < 16; ++localX) {
-                int idx = localZ * 16 + localX;
-                int height = wg.getFirstAvailable(localX, localZ);
-                if (height <= minY) {
-                    height = surface.getFirstAvailable(localX, localZ);
-                }
-                snapshot[idx] = height = GooskerRoadRules.adjustLoadedHeight(world, chunk, localX, localZ, height);
-            }
-        }
-        long chunkKey = pos.toLong();
-        ResourceKey dimensionKey = world.dimension();
-        AsyncExecutor.execute(() -> {
-            CacheStorage storage = state.storage();
-            for (int localZ = 0; localZ < 16; ++localZ) {
-                for (int localX = 0; localX < 16; ++localX) {
-                    int idx = localZ * 16 + localX;
-                    long key = CacheManager.hash(startX + localX, startZ + localZ);
-                    storage.putHeight(key, snapshot[idx]);
-                }
-            }
-            state.putChunkSnapshot(chunkKey, new ChunkHeightSnapshot(snapshot, 16));
-            DebugLog.cache(LOGGER, "Chunk snapshot refreshed for {} ({})", pos, dimensionKey.location());
-        });
+        // no-op by design
     }
 
     public static void onChunkUnload(ServerLevel world, ChunkPos pos) {
-        if (world.isClientSide()) {
-            return;
-        }
-        WorldCacheState state = STATES.get(world.dimension());
-        if (state != null) {
-            state.removeChunkSnapshot(pos.toLong());
-            DebugLog.cache(LOGGER, "Chunk snapshot released for {} ({})", pos, world.dimension().location());
-        }
+        // no-op by design; lazy cache eviction is budget-driven.
     }
 
     /*
@@ -327,41 +317,13 @@ public final class CacheManager {
         int x = (int)(key >> 32);
         int z = (int)key;
         ChunkPos chunkPos = new ChunkPos(x >> 4, z >> 4);
-        long chunkKey = chunkPos.toLong();
-        ChunkHeightSnapshot cached = state.getChunkSnapshot(chunkKey);
-        if (cached != null) {
-            return cached;
-        }
-        CompletableFuture<ChunkHeightSnapshot> future = new CompletableFuture<ChunkHeightSnapshot>();
-        CompletableFuture existing = state.chunkComputations().putIfAbsent(chunkKey, future);
-        if (existing != null) {
-            try {
-                return (ChunkHeightSnapshot)existing.join();
-            }
-            catch (RuntimeException e) {
-                DebugLog.info(LOGGER, "Height snapshot future failed for chunk {}", chunkPos, e);
-                return null;
-            }
-        }
-        try {
-            ChunkHeightSnapshot generated = ChunkHeightGenerator.generate(world, state, storage, chunkPos, 16, 256);
-            if (generated != null) {
-                state.putChunkSnapshot(chunkKey, generated);
-                DebugLog.cache(LOGGER, "Snapshot computed for chunk {} ({} columns)", chunkPos, generated.columns());
-            }
-            future.complete(generated);
-            ChunkHeightSnapshot chunkHeightSnapshot = generated;
-            return chunkHeightSnapshot;
-        }
-        catch (RuntimeException e) {
-            future.completeExceptionally(e);
-            LOGGER.error("Failed to compute height snapshot for chunk {}", (Object)chunkPos, (Object)e);
-            ChunkHeightSnapshot chunkHeightSnapshot = null;
-            return chunkHeightSnapshot;
-        }
-        finally {
-            state.chunkComputations().remove(chunkKey);
-        }
+
+        // 0.3.19 DH-priority policy: never synthesize a 256-column terrain
+        // snapshot as a side effect of a road/path height query. Existing
+        // snapshots may still be consumed, but missing heights fall through to
+        // the caller's single-point generator lookup. This prevents Road
+        // Architect from doing chunk-scale noise work ahead of DH/worldgen.
+        return state.getChunkSnapshot(chunkPos.toLong());
     }
 
     public static CacheStats stats(ServerLevel world) {

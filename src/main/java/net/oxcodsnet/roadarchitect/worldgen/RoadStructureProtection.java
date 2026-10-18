@@ -1,8 +1,11 @@
 package net.oxcodsnet.roadarchitect.worldgen;
 
 import java.util.Locale;
+import java.util.HashMap;
+import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 import net.minecraft.core.BlockPos;
+import net.minecraft.core.registries.BuiltInRegistries;
 import net.minecraft.tags.FluidTags;
 import net.minecraft.world.level.WorldGenLevel;
 import net.minecraft.world.level.block.state.BlockState;
@@ -13,6 +16,36 @@ public final class RoadStructureProtection {
     private static final ConcurrentHashMap<BlockState, Boolean> TERRAIN_CACHE = new ConcurrentHashMap<>();
     private static final ConcurrentHashMap<BlockState, Boolean> BUILDING_CACHE = new ConcurrentHashMap<>();
     private static final ConcurrentHashMap<BlockState, Boolean> DISTINCTIVE_CACHE = new ConcurrentHashMap<>();
+    private static final Map<BlockState, String> NAMES = new ConcurrentHashMap<>();
+    private static final ThreadLocal<PlacementScope> ACTIVE_SCOPE = new ThreadLocal<>();
+
+    public static PlacementScope beginPlacement(WorldGenLevel world) {
+        PlacementScope scope = new PlacementScope(world, ACTIVE_SCOPE.get());
+        ACTIVE_SCOPE.set(scope);
+        return scope;
+    }
+
+    public static final class PlacementScope implements AutoCloseable {
+        private final WorldGenLevel world;
+        private final PlacementScope previous;
+        private final Map<Long, Boolean> underfoot = new HashMap<>();
+        private final Map<Long, Boolean> nearby = new HashMap<>();
+        private final java.util.Set<Long> vegetationChecked = new java.util.HashSet<>();
+        private PlacementScope(WorldGenLevel world, PlacementScope previous) {
+            this.world = world;
+            this.previous = previous;
+        }
+        public void close() {
+            if (previous == null) ACTIVE_SCOPE.remove(); else ACTIVE_SCOPE.set(previous);
+        }
+    }
+
+    /** PREPARE/FINALIZE run consecutively after world generation in this scope. */
+    public static boolean firstVegetationPass(WorldGenLevel world, BlockPos pos) {
+        PlacementScope scope = ACTIVE_SCOPE.get();
+        return scope == null || scope.world != world || scope.vegetationChecked.add(pos.asLong());
+    }
+
     private static final int BUILDING_BUFFER = 2;
     private static final int BUILDING_SCAN_DOWN = 8;
     private static final int BUILDING_SCAN_UP = 5;
@@ -20,12 +53,9 @@ public final class RoadStructureProtection {
     private RoadStructureProtection() {
     }
 
-    /** True only when a road/decor cell is loaded and is not water, ice, or a building. */
+    /** True only when a road/decor cell is loaded and is not fluid water/lava or a building. Ice is valid road terrain. */
     public static boolean isNotWaterBlock(WorldGenLevel world, BlockPos pos) {
         if (world == null || pos == null || !isLoaded(world, pos)) {
-            return false;
-        }
-        if (GooskerRoadSurfaceRules.isIceAtOrBelow(world, pos)) {
             return false;
         }
         BlockState state = world.getBlockState(pos);
@@ -64,6 +94,9 @@ public final class RoadStructureProtection {
         if (!isOpenOrOverlay(world.getBlockState(pos.above()))) {
             return false;
         }
+        if (net.oxcodsnet.roadarchitect.util.GooskerIceSupport.isIce(state)) {
+            return true;
+        }
         BlockState below = world.getBlockState(pos.below());
         String belowId = lower(below);
         return below != null
@@ -98,6 +131,14 @@ public final class RoadStructureProtection {
 
     /** Detects terrain-like roof coverings by inspecting their supporting column. */
     private static boolean hasBuildingUnderfoot(WorldGenLevel world, BlockPos pos) {
+        PlacementScope scope = ACTIVE_SCOPE.get();
+        if (scope != null && scope.world == world && pos != null) {
+            return scope.underfoot.computeIfAbsent(pos.asLong(), ignored -> scanBuildingUnderfoot(world, pos));
+        }
+        return scanBuildingUnderfoot(world, pos);
+    }
+
+    private static boolean scanBuildingUnderfoot(WorldGenLevel world, BlockPos pos) {
         if (world == null || pos == null) {
             return false;
         }
@@ -123,6 +164,14 @@ public final class RoadStructureProtection {
     }
 
     private static boolean hasNearbyBuilding(WorldGenLevel world, BlockPos pos, int radius) {
+        PlacementScope scope = ACTIVE_SCOPE.get();
+        if (scope != null && scope.world == world && pos != null && radius == BUILDING_BUFFER) {
+            return scope.nearby.computeIfAbsent(pos.asLong(), ignored -> scanNearbyBuilding(world, pos, radius));
+        }
+        return scanNearbyBuilding(world, pos, radius);
+    }
+
+    private static boolean scanNearbyBuilding(WorldGenLevel world, BlockPos pos, int radius) {
         if (world == null || pos == null) {
             return false;
         }
@@ -184,6 +233,9 @@ public final class RoadStructureProtection {
             if (id.contains("terrainslabs:") || id.contains("terrain_slabs:")) {
                 return true;
             }
+            if (net.oxcodsnet.roadarchitect.util.GooskerIceSupport.isIce(value)) {
+                return true;
+            }
             String[] names = {
                     "grass_block", "dirt_path", "coarse_dirt", "rooted_dirt", "dirt", "podzol",
                     "mycelium", "mud", "clay", "gravel", "sand", "moss_block", "snow_block",
@@ -226,7 +278,7 @@ public final class RoadStructureProtection {
         });
     }
 
-    private static boolean isDistinctiveBuildingBlock(BlockState state) {
+    public static boolean isDistinctiveBuildingBlock(BlockState state) {
         if (state == null) {
             return false;
         }
@@ -269,12 +321,13 @@ public final class RoadStructureProtection {
     }
 
     private static boolean isIgnorable(String id) {
-        return id.contains("air") || id.contains("water") || id.contains("lava")
+        return id.endsWith(":air") || id.endsWith(":cave_air") || id.endsWith(":void_air")
+                || id.endsWith(":water") || id.endsWith(":lava")
                 || containsId(id, "barrier") || containsId(id, "structure_void");
     }
 
     private static String lower(BlockState state) {
-        return state == null ? "" : String.valueOf(state).toLowerCase(Locale.ROOT);
+        return state == null ? "" : NAMES.computeIfAbsent(state, value -> BuiltInRegistries.BLOCK.getKey(value.getBlock()).toString().toLowerCase(Locale.ROOT));
     }
 
     private static boolean containsId(String id, String needle) {

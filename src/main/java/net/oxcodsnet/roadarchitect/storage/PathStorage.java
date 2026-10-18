@@ -34,6 +34,9 @@ public class PathStorage extends SavedData {
 
     private final Map<String, List<BlockPos>> paths = new ConcurrentHashMap<>();
     private final Map<String, Status> statuses = new ConcurrentHashMap<>();
+    private final java.util.Set<String> pendingKeys = ConcurrentHashMap.newKeySet();
+    private final Map<Long, Map<String, List<BlockPos>>> pointsByChunk = new ConcurrentHashMap<>();
+    private final Map<String, java.util.Set<Long>> chunksByPath = new ConcurrentHashMap<>();
 
     /**
      * Возвращает экземпляр хранилища путей для указанного мира.
@@ -63,9 +66,9 @@ public class PathStorage extends SavedData {
             for (Tag nbtElement : posList) {
                 positions.add(BlockPos.of(((LongTag) nbtElement).getAsLong()));
             }
-            storage.paths.put(key, positions);
+            storage.storePoints(key, positions);
             Status status = net.oxcodsnet.roadarchitect.util.NbtUtils.getEnumOrDefault(entry, STATUS_KEY, Status.class, Status.READY);
-            storage.statuses.put(key, status);
+            storage.publishStatus(key, status == Status.PROCESSING ? Status.PENDING : status);
         }
         return storage;
     }
@@ -102,14 +105,14 @@ public class PathStorage extends SavedData {
      */
     public void putPath(String from, String to, List<BlockPos> path, Status status) {
         String key = KeyUtil.pathKey(from, to);
-        paths.put(key, List.copyOf(path));
-        statuses.put(key, status);
+        storePoints(key, path);
+        publishStatus(key, status);
         setDirty();
     }
 
     public void updatePath(String key, List<BlockPos> path, Status status) {
-        paths.put(key, List.copyOf(path));
-        statuses.put(key, status);
+        storePoints(key, path);
+        publishStatus(key, status);
         setDirty();
     }
 
@@ -125,17 +128,58 @@ public class PathStorage extends SavedData {
         return paths.getOrDefault(key, List.of());
     }
 
+    private synchronized void storePoints(String key, List<BlockPos> path) {
+        var oldChunks=chunksByPath.remove(key);
+        if(oldChunks!=null) for(long chunk:oldChunks) {
+            var entries=pointsByChunk.get(chunk);
+            if(entries!=null) { entries.remove(key); if(entries.isEmpty()) pointsByChunk.remove(chunk); }
+        }
+        var stored=List.copyOf(path);
+        paths.put(key,stored);
+        Map<Long,List<BlockPos>> grouped=new java.util.HashMap<>();
+        for(BlockPos pos:stored) grouped.computeIfAbsent(ChunkPos.asLong(pos.getX()>>4,pos.getZ()>>4),ignored->new ArrayList<>()).add(pos);
+        chunksByPath.put(key,java.util.Set.copyOf(grouped.keySet()));
+        grouped.forEach((chunk,points)->pointsByChunk.computeIfAbsent(chunk,ignored->new ConcurrentHashMap<>()).put(key,List.copyOf(points)));
+    }
+
+    /** Constant-time notification filter; no world reads or all-path scan. */
+    public boolean hasRoadPoints(ChunkPos chunk) { return pointsByChunk.containsKey(chunk.toLong()); }
+
+    /** Used only by the tick worker. READY paths may contain several crossing routes. */
+    public List<BlockPos> readyRoadPoints(ChunkPos chunk) {
+        var entries=pointsByChunk.get(chunk.toLong());
+        if(entries==null) return List.of();
+        java.util.Set<BlockPos> result=new java.util.LinkedHashSet<>();
+        entries.forEach((key,points)-> { if(getStatus(key)==Status.READY) result.addAll(points); });
+        return List.copyOf(result);
+    }
+
     public Status getStatus(String key) {
         return statuses.getOrDefault(key, Status.PENDING);
     }
 
     public void setStatus(String key, Status status) {
-        statuses.put(key, status);
+        publishStatus(key, status);
         setDirty();
     }
 
     public Map<String, Status> allStatuses() {
         return Map.copyOf(statuses);
+    }
+
+    /** Cheap non-copying pending lookup for the per-tick postprocessor pump. */
+    private void publishStatus(String key, Status status) {
+        statuses.put(key, status);
+        if (status == Status.PENDING) pendingKeys.add(key);
+        else pendingKeys.remove(key);
+    }
+
+    public String firstPendingKey() {
+        for (String key : pendingKeys) {
+            if (statuses.get(key) == Status.PENDING) return key;
+            pendingKeys.remove(key);
+        }
+        return null;
     }
 
     public boolean tryMarkProcessing(String key) {
@@ -144,7 +188,7 @@ public class PathStorage extends SavedData {
             if (cur != Status.PENDING) {
                 return false;
             }
-            statuses.put(key, Status.PROCESSING);
+            publishStatus(key, Status.PROCESSING);
             setDirty();
             return true;
         }

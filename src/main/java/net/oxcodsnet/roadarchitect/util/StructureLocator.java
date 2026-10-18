@@ -15,8 +15,6 @@ import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 import java.util.WeakHashMap;
-import java.util.concurrent.ForkJoinPool;
-import java.util.concurrent.ForkJoinTask;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
 import net.minecraft.commands.arguments.ResourceOrTagKeyArgument;
@@ -51,6 +49,7 @@ public final class StructureLocator {
     private static final Logger LOGGER = LoggerFactory.getLogger((String)("roadarchitect/" + StructureLocator.class.getSimpleName()));
     private static final DynamicCommandExceptionType INVALID_STRUCTURE_EXCEPTION = new DynamicCommandExceptionType(id -> Component.translatable((String)"commands.locate.structure.invalid", (Object[])new Object[]{id}));
     private static final int MAX_RING_CANDIDATES_PER_CELL = 16;
+    private static final int MAX_PLANNED_CANDIDATES = 8192;
     private static final Map<Registry<Structure>, Map<String, HolderSet<Structure>>> SELECTOR_CACHE = new WeakHashMap<Registry<Structure>, Map<String, HolderSet<Structure>>>();
     private static final Map<MinecraftServer, NegCache> NEGATIVE_CACHE = new WeakHashMap<MinecraftServer, NegCache>();
 
@@ -104,6 +103,12 @@ public final class StructureLocator {
     }
 
     public static List<Pair<BlockPos, String>> scanGridAsync(ServerLevel world, BlockPos origin, int overallRadius, int scanRadius, List<String> structureSelectors, boolean allowChunkLoads) {
+        // Post-load triggers already know a target starts in this completed chunk.
+        // Resolve its actual starts directly: no placement planning, disk presence
+        // checks, negative-cache poisoning, or ring-position future waits.
+        if (!allowChunkLoads && overallRadius == 1) {
+            return scanLoadedStarts(world, origin, structureSelectors);
+        }
         PipelineProfiler.increment("structure_locator.invocations");
         PipelineProfiler.recordValue("structure_locator.selector_input", structureSelectors.size());
         PipelineProfiler.recordValue("structure_locator.overall_radius", overallRadius);
@@ -140,7 +145,10 @@ public final class StructureLocator {
             }
             PipelineProfiler.recordValue("structure_locator.grid_cells", cells.size());
             try (PipelineProfiler.Section planning = PipelineProfiler.openSection("structure_locator.plan_candidates");){
-                planned = (List)((ForkJoinTask)ForkJoinPool.commonPool().submit(() -> cells.parallelStream().flatMap(cell -> StructureLocator.planCandidatesForCell(index, cell, scanRadius)).collect(Collectors.toCollection(ArrayList::new)))).join();
+                planned = cells.stream()
+                        .flatMap(cell -> StructureLocator.planCandidatesForCell(index, cell, scanRadius))
+                        .limit(MAX_PLANNED_CANDIDATES)
+                        .collect(Collectors.toCollection(ArrayList::new));
             }
             PipelineProfiler.recordValue("structure_locator.planned_candidates", planned.size());
             try (PipelineProfiler.Section resolve = PipelineProfiler.openSection("structure_locator.resolve_candidates");){
@@ -151,6 +159,29 @@ public final class StructureLocator {
             List<Pair<BlockPos, String>> list = found;
             return list;
         }
+    }
+
+
+    private static List<Pair<BlockPos, String>> scanLoadedStarts(ServerLevel world, BlockPos origin,
+                                                                List<String> selectors) {
+        var chunk = world.getChunkSource().getChunkNow(origin.getX() >> 4, origin.getZ() >> 4);
+        if (chunk == null) return List.of();
+        Registry<Structure> registry = world.registryAccess().registryOrThrow(Registries.STRUCTURE);
+        List<HolderSet<Structure>> compiled = compileSelectors(registry, selectors);
+        List<Pair<BlockPos, String>> found = new ArrayList<>();
+        for (var start : chunk.getAllStarts().values()) {
+            if (!start.isValid()) continue;
+            var holder = registry.wrapAsHolder(start.getStructure());
+            boolean selected = compiled.stream().anyMatch(group -> group.contains(holder));
+            if (!selected) continue;
+            var cp = start.getChunkPos();
+            int x = cp.getMinBlockX() + 8;
+            int z = cp.getMinBlockZ() + 8;
+            ResourceLocation id = registry.getKey(start.getStructure());
+            if (id != null) found.add(Pair.of(new BlockPos(x, CacheManager.getHeight(world, x, z), z), id.toString()));
+        }
+        schedulePersistence(world, found);
+        return found;
     }
 
     private static PlacementIndex buildPlacementIndex(ServerLevel world, List<HolderSet<Structure>> compiledSelectors) {
@@ -297,8 +328,17 @@ public final class StructureLocator {
         server.execute(() -> {
             RoadGraphState graph = RoadGraphState.get(world);
             for (Pair pair : found) {
-                Node node = graph.addNodeWithEdges((BlockPos)pair.getFirst(), (String)pair.getSecond());
-                DebugLog.info(LOGGER, "Added node {} at {} ({})", node.id(), node.pos(), pair.getSecond());
+                BlockPos rawPos = (BlockPos) pair.getFirst();
+                String type = (String) pair.getSecond();
+                BlockPos endpoint = GooskerStructureEndpoint.resolveDiscovered(rawPos, world, type);
+                if (endpoint == null) {
+                    // Entrance refinement touched a chunk that is not a completed
+                    // LevelChunk yet. Do not block or persist a guessed endpoint;
+                    // a later CHUNK/PERIODIC scan can retry once the area is ready.
+                    continue;
+                }
+                Node node = graph.addNodeWithEdges(endpoint, type);
+                DebugLog.info(LOGGER, "Added node {} at {} ({})", node.id(), node.pos(), type);
             }
             graph.setDirty();
         });

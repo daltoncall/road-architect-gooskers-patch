@@ -454,6 +454,11 @@ public class PathFinder {
     private int sampleHeight(int x, int z) {
         profHeightCalls++;
         long key = hash(x, z);
+        // Plan against natural generator terrain, not the live LevelChunk heightmap,
+        // so roofs, logs, and player/generated builds cannot become path elevations.
+        // CacheManager 0.3.19+ only reuses an existing chunk snapshot here; a cache
+        // miss performs this single-point generator lookup and never creates a new
+        // 16x16/256-column snapshot.
         return CacheManager.getHeight(world, key, () ->
                 generator.getBaseHeight(x, z, Heightmap.Types.WORLD_SURFACE_WG, world, noiseConfig)
         );
@@ -498,16 +503,29 @@ public class PathFinder {
 
     private List<BlockPos> reconstructVertices(long goal, long start, Long2LongMap parent) {
         List<BlockPos> vertices = new ArrayList<>();
-        for (long k = goal; ; k = parent.get(k)) {
+        Set<Long> seen = new HashSet<>();
+        int budget = Math.max(64, Math.min(this.maxSteps + 2, 20000));
+        long k = goal;
+        for (int hops = 0; hops < budget; hops++) {
+            if (!seen.add(k)) {
+                LOGGER.error("Aborting path reconstruction: parent cycle detected at {}", k);
+                return List.of();
+            }
             BlockPos p = keyToPos(k);
             int y = sampleHeight(p.getX(), p.getZ());
             vertices.add(new BlockPos(p.getX(), y, p.getZ()));
             if (k == start) {
-                break;
+                Collections.reverse(vertices);
+                return vertices;
             }
+            if (!parent.containsKey(k)) {
+                LOGGER.error("Aborting path reconstruction: missing parent for {} before reaching start {}", k, start);
+                return List.of();
+            }
+            k = parent.get(k);
         }
-        Collections.reverse(vertices);
-        return vertices;
+        LOGGER.error("Aborting path reconstruction after {} hops (budget exceeded)", budget);
+        return List.of();
     }
 
     /**
